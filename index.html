@@ -91,9 +91,10 @@
     const collectAllData = async (cafes, filterFn) => {
       const rows = [];
       await Promise.all(cafes.map(async cafe => {
-        const [ct,tc,dn,ac,pv] = await Promise.all(["caisseta","tcam","dons","achats","privatisation"].map(s=>loadData(cafe,s)));
+        const [ct,tc,dn,ac,pv,adh] = await Promise.all(["caisseta","tcam","dons","achats","privatisation","adhesion"].map(s=>loadData(cafe,s)));
         const all = [{s:"caisseta",d:ct},{s:"tcam",d:tc},{s:"dons",d:dn},{s:"achats",d:ac},{s:"privatisation",d:pv}];
         all.forEach(({s,d})=>d.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:s.toUpperCase(),...r})));
+        explodeAdhesion(adh.filter(filterFn), cafe).forEach(r=>rows.push(r));
       }));
       return rows;
     };
@@ -290,10 +291,37 @@
       const a    = document.createElement("a"); a.href=url; a.download=filename;
       document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
     };
+    /* ── Explode adhesion rows into flat lines like other sections ── */
+    const MODES_ADH_ALL = ["Espèces","CB","Chèque","Virement","Prélèvement"];
+    const explodeAdhesion = (rows, cafe) => {
+      const flat = [];
+      rows.forEach(r => {
+        ["Individuelles","Structure"].forEach(type => {
+          const pfx = type === "Individuelles" ? "indiv" : "struc";
+          MODES_ADH_ALL.forEach(m => {
+            const montant = parseFloat(r[`${pfx}_${m}`]) || 0;
+            if (montant === 0) return;
+            flat.push({
+              ...(cafe ? {Café: cafe} : {}),
+              Section: "ADHESION",
+              date: r.date,
+              semaine: r.semaine,
+              mois: r.mois,
+              produit: `Adhésion ${type}`,
+              mode: m,
+              montant,
+            });
+          });
+        });
+      });
+      return flat;
+    };
+
     const exportToXLSX = (cafe, period, periodType, allData) => {
       const fn = (row) => { if (!row.date) return false; if (periodType==="week") return row.semaine===period; if (periodType==="month") return row.mois===parseInt(period.replace("M","")); return true; };
       const rows = [];
-      ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Section:s.toUpperCase(),...r})));
+      ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(),...r})));
+      explodeAdhesion((allData.adhesion||[]).filter(fn), cafe).forEach(r => rows.push(r));
       buildAndDownloadCSV(rows, `DaddyCafe_${cafe}_${period}_${new Date().toISOString().slice(0,10)}.csv`);
     };
 
@@ -421,7 +449,7 @@
         // Purge
         let deleted = 0;
         await Promise.all(cafes.map(async cafe=>{
-          await Promise.all(["caisseta","tcam","dons","achats","privatisation"].map(async section=>{
+          await Promise.all(["caisseta","tcam","dons","achats","privatisation","adhesion"].map(async section=>{
             const data = await loadData(cafe, section);
             const kept = data.filter(r=>!r.date||new Date(r.date)>=cutoff);
             deleted += data.length - kept.length;
@@ -735,13 +763,13 @@
 
     /* ── DASHBOARD ── */
     const Dashboard = ({ cafe }) => {
-      const [allData,setAllData]=useState({caisseta:[],tcam:[],dons:[],achats:[],privatisation:[]}); const [loading,setLoading]=useState(true);
+      const [allData,setAllData]=useState({caisseta:[],tcam:[],dons:[],achats:[],privatisation:[],adhesion:[]}); const [loading,setLoading]=useState(true);
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
-      useEffect(()=>{ (async()=>{ setLoading(true); const [caisseta,tcam,dons,achats,privatisation]=await Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons"),loadData(cafe,"achats"),loadData(cafe,"privatisation")]); setAllData({caisseta,tcam,dons,achats,privatisation}); setLoading(false); })(); },[cafe]);
+      useEffect(()=>{ (async()=>{ setLoading(true); const [caisseta,tcam,dons,achats,privatisation,adhesion]=await Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons"),loadData(cafe,"achats"),loadData(cafe,"privatisation"),loadData(cafe,"adhesion")]); setAllData({caisseta,tcam,dons,achats,privatisation,adhesion}); setLoading(false); })(); },[cafe]);
       const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
-      const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation);
-      const tTA=sum(fTA),tTCAM=sum(fTCAM,"montant"),tD=sum(fD,"montant"),tA=sum(fA,"montant"),tP=sum(fP,"montant_facture");
+      const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation),fADH=fil(allData.adhesion);
+      const tTA=sum(fTA),tTCAM=sum(fTCAM,"montant"),tD=sum(fD,"montant"),tA=sum(fA,"montant"),tP=sum(fP,"montant_facture"),tADH=sum(fADH,"total");
       const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; exportToXLSX(cafe,p,ft,allData); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       return (
@@ -760,16 +788,88 @@
             <StatCard label="Total Dons" value={`${tD.toFixed(2)} €`} sub={`${fD.length} dons`} color="rose"/>
             <StatCard label="Total Achats" value={`${tA.toFixed(2)} €`} sub={`${fA.length} achats`} color="sky"/>
             <StatCard label="Privatisations" value={`${tP.toFixed(2)} €`} sub={`${fP.length} événements`} color="violet"/>
-            <StatCard label="Total encaissé" value={`${(tTA+tTCAM+tD+tP).toFixed(2)} €`} sub="TA + TCAM + Dons + Privat." color="emerald"/>
+            <StatCard label="Adhésions" value={`${tADH.toFixed(2)} €`} sub={`${fADH.length} saisies`} color="violet"/>
+            <StatCard label="Total encaissé" value={`${(tTA+tTCAM+tD+tP+tADH).toFixed(2)} €`} sub="TA + TCAM + Dons + Privat. + Adh." color="emerald"/>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">TA — Répartition par mode</h4>{MODES.map(m=>{const v=sum(fTA.filter(r=>r.mode===m));if(v===0)return null;return<div key={m} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0"><span className="text-sm text-gray-600">{m}</span><span className="font-semibold text-emerald-600">{v.toFixed(2)} €</span></div>;})} {MODES.every(m=>sum(fTA.filter(r=>r.mode===m))===0)&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}</div>
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
+              <h4 className="text-sm font-semibold text-gray-700 mb-1">Modes de paiement</h4>
+              <p className="text-xs text-gray-400 mb-3">Montants encaissés — TA + TCAM + Dons + Adhésions confondus</p>
+              {MODES.map(m=>{
+                const vTA=sum(fTA.filter(r=>r.mode===m));
+                const vTC=sum(fTCAM.filter(r=>r.mode===m),"montant");
+                const vD=sum(fD.filter(r=>r.mode===m),"montant");
+                const vADH=fADH.reduce((s,r)=>s+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0);
+                const v=vTA+vTC+vD+vADH;
+                if(v===0)return null;
+                return<div key={m} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0">
+                  <span className="text-sm text-gray-600">{m}</span>
+                  <div className="text-right">
+                    <span className="font-semibold text-gray-800">{v.toFixed(2)} €</span>
+                    <span className="text-xs text-gray-400 ml-2">({[vTA>0?`TA:${vTA.toFixed(2)}€`:"",vTC>0?`TCAM:${vTC.toFixed(2)}€`:"",vD>0?`Dons:${vD.toFixed(2)}€`:"",vADH>0?`Adh:${vADH.toFixed(2)}€`:""].filter(Boolean).join(" · ")})</span>
+                  </div>
+                </div>;
+              })}
+              {MODES.every(m=>sum(fTA.filter(r=>r.mode===m))+sum(fTCAM.filter(r=>r.mode===m),"montant")+sum(fD.filter(r=>r.mode===m),"montant")+fADH.reduce((s,r)=>s+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0)===0)&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}
+            </div>
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">TA — Répartition par type</h4>{["Soft","Alcool","Nourriture"].map(t=>{const v=sum(fTA.filter(r=>r.typo===t));if(v===0)return null;return<div key={t} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0"><span className="text-sm text-gray-600">{t}</span><span className="font-semibold text-emerald-600">{v.toFixed(2)} €</span></div>;})} {["Soft","Alcool","Nourriture"].every(t=>sum(fTA.filter(r=>r.typo===t))===0)&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}</div>
           </div>
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
             <h4 className="text-sm font-semibold text-gray-700 mb-3">Récap. hebdomadaire</h4>
-            <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
-            <tbody>{WEEKS_2026.slice(0,20).map(w=>{ const wTA=sum(allData.caisseta.filter(r=>r.semaine===w.label)),wTC=sum(allData.tcam.filter(r=>r.semaine===w.label),"montant"),wD=sum(allData.dons.filter(r=>r.semaine===w.label),"montant"),wA=sum(allData.achats.filter(r=>r.semaine===w.label),"montant"); if(wTA+wTC+wD+wA===0)return null; return<tr key={w.label} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{w.label}</td><td className="px-3 py-2 text-emerald-600">{wTA.toFixed(2)}€</td><td className="px-3 py-2 text-amber-600">{wTC.toFixed(2)}€</td><td className="px-3 py-2 text-rose-600">{wD.toFixed(2)}€</td><td className="px-3 py-2 text-sky-600">-{wA.toFixed(2)}€</td><td className="px-3 py-2 font-bold text-gray-800">{(wTA+wTC+wD).toFixed(2)}€</td></tr>; })}</tbody></table></div>
+            <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
+            <tbody>{WEEKS_2026.slice(0,20).map(w=>{ const wTA=sum(allData.caisseta.filter(r=>r.semaine===w.label)),wTC=sum(allData.tcam.filter(r=>r.semaine===w.label),"montant"),wD=sum(allData.dons.filter(r=>r.semaine===w.label),"montant"),wA=sum(allData.achats.filter(r=>r.semaine===w.label),"montant"),wADH=sum(allData.adhesion.filter(r=>r.semaine===w.label),"total"); if(wTA+wTC+wD+wA+wADH===0)return null; return<tr key={w.label} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{w.label}</td><td className="px-3 py-2 text-emerald-600">{wTA.toFixed(2)}€</td><td className="px-3 py-2 text-amber-600">{wTC.toFixed(2)}€</td><td className="px-3 py-2 text-rose-600">{wD.toFixed(2)}€</td><td className="px-3 py-2 text-indigo-600">{wADH.toFixed(2)}€</td><td className="px-3 py-2 text-sky-600">-{wA.toFixed(2)}€</td><td className="px-3 py-2 font-bold text-gray-800">{(wTA+wTC+wD+wADH).toFixed(2)}€</td></tr>; })}</tbody></table></div>
+          </div>
+          {/* ── PNL ANNUEL ── */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+            <div className="px-5 py-3 bg-gray-50 border-b border-gray-100"><h4 className="text-sm font-semibold text-gray-700">📈 P&L annuel 2026</h4></div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead><tr className="bg-gray-50 border-b border-gray-100">
+                  <th className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold w-36">Indicateur</th>
+                  {MONTHS.map((m,i)=><th key={i} className="text-right px-2 py-2 text-gray-500 uppercase tracking-wide font-semibold">{m.slice(0,3).toUpperCase()}</th>)}
+                  <th className="text-right px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">TOTAL</th>
+                </tr></thead>
+                <tbody>
+                  {(()=>{
+                    const byMonth = (arr, key="prix_total") => MONTHS.map((_,i)=>arr.filter(r=>r.mois===i+1).reduce((s,r)=>s+(parseFloat(r[key])||0),0));
+                    const taM=byMonth(allData.caisseta);
+                    const tcM=byMonth(allData.tcam,"montant");
+                    const dnM=byMonth(allData.dons,"montant");
+                    const acM=byMonth(allData.achats,"montant");
+                    const adhM=byMonth(allData.adhesion,"total");
+                    const recM=MONTHS.map((_,i)=>taM[i]+tcM[i]+dnM[i]+adhM[i]);
+                    const margeM=MONTHS.map((_,i)=>recM[i]-acM[i]);
+                    const totRec=recM.reduce((a,b)=>a+b,0);
+                    const totAc=acM.reduce((a,b)=>a+b,0);
+                    const totMarge=totRec-totAc;
+                    const fmt=(v)=>v===0?"—":`${v.toFixed(0)}€`;
+                    const fmtPct=(m,r)=>r===0?"—":`${((m/r)*100).toFixed(0)}%`;
+                    return <>
+                      <tr className="border-t border-gray-50 hover:bg-gray-50">
+                        <td className="px-3 py-2 font-medium text-emerald-700">Recettes</td>
+                        {recM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-emerald-600">{fmt(v)}</td>)}
+                        <td className="px-3 py-2 text-right font-bold text-emerald-700">{fmt(totRec)}</td>
+                      </tr>
+                      <tr className="border-t border-gray-50 hover:bg-gray-50">
+                        <td className="px-3 py-2 font-medium text-sky-700">Charges</td>
+                        {acM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-sky-600">{fmt(v)}</td>)}
+                        <td className="px-3 py-2 text-right font-bold text-sky-700">{fmt(totAc)}</td>
+                      </tr>
+                      <tr className="border-t border-gray-100 bg-gray-50 hover:bg-gray-100">
+                        <td className="px-3 py-2 font-semibold text-gray-800">Marge opé.</td>
+                        {margeM.map((v,i)=><td key={i} className={`px-2 py-2 text-right font-medium ${v>=0?"text-emerald-600":"text-rose-600"}`}>{fmt(v)}</td>)}
+                        <td className={`px-3 py-2 text-right font-bold ${totMarge>=0?"text-emerald-700":"text-rose-700"}`}>{fmt(totMarge)}</td>
+                      </tr>
+                      <tr className="border-t border-gray-50 hover:bg-gray-50">
+                        <td className="px-3 py-2 font-medium text-gray-600">Marge opé. %</td>
+                        {margeM.map((v,i)=><td key={i} className={`px-2 py-2 text-right ${v>=0?"text-emerald-600":"text-rose-600"}`}>{fmtPct(v,recM[i])}</td>)}
+                        <td className={`px-3 py-2 text-right font-bold ${totMarge>=0?"text-emerald-700":"text-rose-700"}`}>{fmtPct(totMarge,totRec)}</td>
+                      </tr>
+                    </>;
+                  })()}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       );
@@ -830,17 +930,17 @@
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
       const [subTab,setSubTab]=useState("dashboard");
 
-      useEffect(()=>{ (async()=>{ setLoading(true); const r={}; await Promise.all(cafes.map(async c=>{ const [ct,tc,dn,ac,pv]=await Promise.all([loadData(c,"caisseta"),loadData(c,"tcam"),loadData(c,"dons"),loadData(c,"achats"),loadData(c,"privatisation")]); r[c]={caisseta:ct,tcam:tc,dons:dn,achats:ac,privatisation:pv}; })); setAllCafesData(r); setLoading(false); })(); },[cafes]);
+      useEffect(()=>{ (async()=>{ setLoading(true); const r={}; await Promise.all(cafes.map(async c=>{ const [ct,tc,dn,ac,pv,adh]=await Promise.all([loadData(c,"caisseta"),loadData(c,"tcam"),loadData(c,"dons"),loadData(c,"achats"),loadData(c,"privatisation"),loadData(c,"adhesion")]); r[c]={caisseta:ct,tcam:tc,dons:dn,achats:ac,privatisation:pv,adhesion:adh}; })); setAllCafesData(r); setLoading(false); })(); },[cafes]);
 
       const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
 
-      const stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{caisseta:[],tcam:[],dons:[],achats:[],privatisation:[]}; const fTA=fil(d.caisseta),fTC=fil(d.tcam),fD=fil(d.dons),fA=fil(d.achats),fP=fil(d.privatisation); const ta=sum(fTA),tc=sum(fTC,"montant"),dn=sum(fD,"montant"),ac=sum(fA,"montant"),pv=sum(fP,"montant_facture"); return{cafe,ta,tc,dn,ac,pv,total:ta+tc+dn+pv,fTA,fTC,fD}; });
-      const GT=stats.reduce((s,c)=>({ta:s.ta+c.ta,tc:s.tc+c.tc,dn:s.dn+c.dn,ac:s.ac+c.ac,pv:s.pv+c.pv,total:s.total+c.total}),{ta:0,tc:0,dn:0,ac:0,pv:0,total:0});
+      const stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{caisseta:[],tcam:[],dons:[],achats:[],privatisation:[],adhesion:[]}; const fTA=fil(d.caisseta),fTC=fil(d.tcam),fD=fil(d.dons),fA=fil(d.achats),fP=fil(d.privatisation),fADH=fil(d.adhesion); const ta=sum(fTA),tc=sum(fTC,"montant"),dn=sum(fD,"montant"),ac=sum(fA,"montant"),pv=sum(fP,"montant_facture"),adh=sum(fADH,"total"); return{cafe,ta,tc,dn,ac,pv,adh,total:ta+tc+dn+pv+adh,fTA,fTC,fD,fADH}; });
+      const GT=stats.reduce((s,c)=>({ta:s.ta+c.ta,tc:s.tc+c.tc,dn:s.dn+c.dn,ac:s.ac+c.ac,pv:s.pv+c.pv,adh:s.adh+c.adh,total:s.total+c.total}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,total:0});
 
-      const weekly=WEEKS_2026.slice(0,20).map(w=>{ let ta=0,tc=0,dn=0,ac=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); }); return{week:w.label,ta,tc,dn,ac,total:ta+tc+dn}; }).filter(r=>r.ta+r.tc+r.dn+r.ac>0);
+      const weekly=WEEKS_2026.slice(0,20).map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); }); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh}; }).filter(r=>r.ta+r.tc+r.dn+r.ac+r.adh>0);
 
-      const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ if(!r.date)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),...r}))); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
+      const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ if(!r.date)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),...r}))); explodeAdhesion((d.adhesion||[]).filter(fn),c).forEach(r=>rows.push(r)); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
 
       if(loading)return<div className="p-12 text-center text-gray-400">Chargement de tous les cafés…</div>;
 
@@ -867,15 +967,16 @@
               <StatCard label="Total Dons — tous cafés" value={`${GT.dn.toFixed(2)} €`} color="rose"/>
               <StatCard label="Total Achats — tous cafés" value={`${GT.ac.toFixed(2)} €`} color="sky"/>
               <StatCard label="Privatisations" value={`${GT.pv.toFixed(2)} €`} color="violet"/>
-              <StatCard label="GRAND TOTAL encaissé" value={`${GT.total.toFixed(2)} €`} color="emerald" sub="TA + TCAM + Dons + Privat."/>
+              <StatCard label="Adhésions — tous cafés" value={`${GT.adh.toFixed(2)} €`} color="violet"/>
+              <StatCard label="GRAND TOTAL encaissé" value={`${GT.total.toFixed(2)} €`} color="emerald" sub="TA + TCAM + Dons + Privat. + Adh."/>
             </div>
             {/* Tableau par café */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
               <div className="px-5 py-3 bg-gray-50 border-b border-gray-100"><h4 className="text-sm font-semibold text-gray-700">Détail par café</h4></div>
               <div className="overflow-x-auto"><table className="w-full text-sm">
-                <thead><tr className="bg-gray-50 border-b border-gray-100">{["Café","TA","TCAM","Dons","Achats","Privatisations","Total encaissé"].map(h=><th key={h} className="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>)}</tr></thead>
+                <thead><tr className="bg-gray-50 border-b border-gray-100">{["Café","TA","TCAM","Dons","Achats","Privatisations","Adhésions","Total encaissé"].map(h=><th key={h} className="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>)}</tr></thead>
                 <tbody>
-                  {stats.map(({cafe,ta,tc,dn,ac,pv,total},i)=>(
+                  {stats.map(({cafe,ta,tc,dn,ac,pv,adh,total},i)=>(
                     <tr key={cafe} className="border-t border-gray-50 hover:bg-gray-50 transition-colors">
                       <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{backgroundColor:CAFE_COLORS_LIST[i%CAFE_COLORS_LIST.length]}}></span><span className="font-medium text-gray-800">{cafe}</span></div></td>
                       <td className="px-4 py-3 text-emerald-600 font-medium">{ta.toFixed(2)} €</td>
@@ -883,45 +984,320 @@
                       <td className="px-4 py-3 text-rose-600 font-medium">{dn.toFixed(2)} €</td>
                       <td className="px-4 py-3 text-sky-600 font-medium">−{ac.toFixed(2)} €</td>
                       <td className="px-4 py-3 text-violet-600 font-medium">{pv.toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-indigo-600 font-medium">{adh.toFixed(2)} €</td>
                       <td className="px-4 py-3 font-bold text-gray-800">{total.toFixed(2)} €</td>
                     </tr>
                   ))}
                   <tr className="border-t-2 border-gray-200 bg-gray-50 font-bold text-sm">
                     <td className="px-4 py-3 text-gray-700">TOTAL</td>
-                    <td className="px-4 py-3 text-emerald-700">{GT.ta.toFixed(2)} €</td><td className="px-4 py-3 text-amber-700">{GT.tc.toFixed(2)} €</td><td className="px-4 py-3 text-rose-700">{GT.dn.toFixed(2)} €</td><td className="px-4 py-3 text-sky-700">−{GT.ac.toFixed(2)} €</td><td className="px-4 py-3 text-violet-700">{GT.pv.toFixed(2)} €</td><td className="px-4 py-3 text-gray-900">{GT.total.toFixed(2)} €</td>
+                    <td className="px-4 py-3 text-emerald-700">{GT.ta.toFixed(2)} €</td><td className="px-4 py-3 text-amber-700">{GT.tc.toFixed(2)} €</td><td className="px-4 py-3 text-rose-700">{GT.dn.toFixed(2)} €</td><td className="px-4 py-3 text-sky-700">−{GT.ac.toFixed(2)} €</td><td className="px-4 py-3 text-violet-700">{GT.pv.toFixed(2)} €</td><td className="px-4 py-3 text-indigo-700">{GT.adh.toFixed(2)} €</td><td className="px-4 py-3 text-gray-900">{GT.total.toFixed(2)} €</td>
                   </tr>
                 </tbody>
               </table></div>
             </div>
-            {/* Modes de paiement globaux (TA + TCAM + Dons) + types TA */}
+            {/* Modes de paiement globaux (TA + TCAM + Dons + Adhésions) + types TA */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
                 <h4 className="text-sm font-semibold text-gray-700 mb-1">Modes de paiement</h4>
-                <p className="text-xs text-gray-400 mb-3">Montants encaissés par mode — TA + TCAM + Dons confondus</p>
-                {MODES.map(m=>{
+                <p className="text-xs text-gray-400 mb-3">TA + TCAM + Dons + Adhésions — tous cafés</p>
+                {[...MODES,"Prélèvement"].map(m=>{
                   const vTA  = stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.mode===m)),0);
                   const vTC  = stats.reduce((s,c)=>s+sum(c.fTC.filter(r=>r.mode===m),"montant"),0);
                   const vD   = stats.reduce((s,c)=>s+sum(c.fD.filter(r=>r.mode===m),"montant"),0);
-                  const v    = vTA+vTC+vD;
+                  const vADH = stats.reduce((s,c)=>s+c.fADH.reduce((a,r)=>a+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0),0);
+                  const v    = vTA+vTC+vD+vADH;
                   if(v===0) return null;
                   return <div key={m} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0">
                     <span className="text-sm text-gray-600">{m}</span>
-                    <div className="text-right">
-                      <span className="font-semibold text-gray-800">{v.toFixed(2)} €</span>
-                      <span className="text-xs text-gray-400 ml-2">({vTA>0?`TA: ${vTA.toFixed(2)}€`:""}{vTC>0?(vTA>0?" · ":"")+`TCAM: ${vTC.toFixed(2)}€`:""}{vD>0?(vTA+vTC>0?" · ":"")+`Dons: ${vD.toFixed(2)}€`:""})</span>
-                    </div>
+                    <span className="font-semibold text-gray-800">{v.toFixed(2)} €</span>
                   </div>;
                 })}
-                {MODES.every(m=>{ const vTA=stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.mode===m)),0); const vTC=stats.reduce((s,c)=>s+sum(c.fTC.filter(r=>r.mode===m),"montant"),0); const vD=stats.reduce((s,c)=>s+sum(c.fD.filter(r=>r.mode===m),"montant"),0); return vTA+vTC+vD===0; })&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}
+                {[...MODES,"Prélèvement"].every(m=>{ const vTA=stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.mode===m)),0); const vTC=stats.reduce((s,c)=>s+sum(c.fTC.filter(r=>r.mode===m),"montant"),0); const vD=stats.reduce((s,c)=>s+sum(c.fD.filter(r=>r.mode===m),"montant"),0); const vADH=stats.reduce((s,c)=>s+c.fADH.reduce((a,r)=>a+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0),0); return vTA+vTC+vD+vADH===0; })&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}
               </div>
               <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">TA global — Répartition par type</h4>{["Soft","Alcool","Nourriture"].map(t=>{const v=stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.typo===t)),0);if(v===0)return null;return<div key={t} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0"><span className="text-sm text-gray-600">{t}</span><span className="font-semibold text-emerald-600">{v.toFixed(2)} €</span></div>;})} {["Soft","Alcool","Nourriture"].every(t=>stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.typo===t)),0)===0)&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}</div>
             </div>
             {/* Récap hebdo */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">Récap. hebdomadaire — tous cafés</h4>
-              {weekly.length===0?<p className="text-sm text-gray-400 text-center py-6">Aucune donnée</p>:<div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
-              <tbody>{weekly.map(r=><tr key={r.week} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{r.week}</td><td className="px-3 py-2 text-emerald-600">{r.ta.toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">{r.tc.toFixed(2)} €</td><td className="px-3 py-2 text-rose-600">{r.dn.toFixed(2)} €</td><td className="px-3 py-2 text-sky-600">−{r.ac.toFixed(2)} €</td><td className="px-3 py-2 font-bold text-gray-800">{r.total.toFixed(2)} €</td></tr>)}</tbody></table></div>}
+              {weekly.length===0?<p className="text-sm text-gray-400 text-center py-6">Aucune donnée</p>:<div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
+              <tbody>{weekly.map(r=><tr key={r.week} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{r.week}</td><td className="px-3 py-2 text-emerald-600">{r.ta.toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">{r.tc.toFixed(2)} €</td><td className="px-3 py-2 text-rose-600">{r.dn.toFixed(2)} €</td><td className="px-3 py-2 text-indigo-600">{r.adh.toFixed(2)} €</td><td className="px-3 py-2 text-sky-600">−{r.ac.toFixed(2)} €</td><td className="px-3 py-2 font-bold text-gray-800">{r.total.toFixed(2)} €</td></tr>)}</tbody></table></div>}
+            </div>
+            {/* ── PNL ANNUEL GLOBAL ── */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+              <div className="px-5 py-3 bg-gray-50 border-b border-gray-100"><h4 className="text-sm font-semibold text-gray-700">📈 P&L annuel 2026 — Tous cafés</h4></div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead><tr className="bg-gray-50 border-b border-gray-100">
+                    <th className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold w-36">Indicateur</th>
+                    {MONTHS.map((m,i)=><th key={i} className="text-right px-2 py-2 text-gray-500 uppercase tracking-wide font-semibold">{m.slice(0,3).toUpperCase()}</th>)}
+                    <th className="text-right px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">TOTAL</th>
+                  </tr></thead>
+                  <tbody>
+                    {(()=>{
+                      const sumM=(arr,key)=>MONTHS.map((_,i)=>arr.filter(r=>r.mois===i+1).reduce((s,r)=>s+(parseFloat(r[key])||0),0));
+                      const addM=(a,b)=>a.map((v,i)=>v+b[i]);
+                      let recM=MONTHS.map(()=>0), acM=MONTHS.map(()=>0);
+                      cafes.forEach(c=>{
+                        const d=allCafesData[c]||{};
+                        recM=addM(recM,addM(addM(addM(sumM(d.caisseta||[],"prix_total"),sumM(d.tcam||[],"montant")),sumM(d.dons||[],"montant")),sumM(d.adhesion||[],"total")));
+                        acM=addM(acM,sumM(d.achats||[],"montant"));
+                      });
+                      const margeM=recM.map((v,i)=>v-acM[i]);
+                      const totRec=recM.reduce((a,b)=>a+b,0), totAc=acM.reduce((a,b)=>a+b,0), totMarge=totRec-totAc;
+                      const fmt=v=>v===0?"—":`${v.toFixed(0)}€`;
+                      const fmtPct=(m,r)=>r===0?"—":`${((m/r)*100).toFixed(0)}%`;
+                      return <>
+                        <tr className="border-t border-gray-50 hover:bg-gray-50">
+                          <td className="px-3 py-2 font-medium text-emerald-700">Recettes</td>
+                          {recM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-emerald-600">{fmt(v)}</td>)}
+                          <td className="px-3 py-2 text-right font-bold text-emerald-700">{fmt(totRec)}</td>
+                        </tr>
+                        <tr className="border-t border-gray-50 hover:bg-gray-50">
+                          <td className="px-3 py-2 font-medium text-sky-700">Charges</td>
+                          {acM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-sky-600">{fmt(v)}</td>)}
+                          <td className="px-3 py-2 text-right font-bold text-sky-700">{fmt(totAc)}</td>
+                        </tr>
+                        <tr className="border-t border-gray-100 bg-gray-50 hover:bg-gray-100">
+                          <td className="px-3 py-2 font-semibold text-gray-800">Marge opé.</td>
+                          {margeM.map((v,i)=><td key={i} className={`px-2 py-2 text-right font-medium ${v>=0?"text-emerald-600":"text-rose-600"}`}>{fmt(v)}</td>)}
+                          <td className={`px-3 py-2 text-right font-bold ${totMarge>=0?"text-emerald-700":"text-rose-700"}`}>{fmt(totMarge)}</td>
+                        </tr>
+                        <tr className="border-t border-gray-50 hover:bg-gray-50">
+                          <td className="px-3 py-2 font-medium text-gray-600">Marge opé. %</td>
+                          {margeM.map((v,i)=><td key={i} className={`px-2 py-2 text-right ${v>=0?"text-emerald-600":"text-rose-600"}`}>{fmtPct(v,recM[i])}</td>)}
+                          <td className={`px-3 py-2 text-right font-bold ${totMarge>=0?"text-emerald-700":"text-rose-700"}`}>{fmtPct(totMarge,totRec)}</td>
+                        </tr>
+                      </>;
+                    })()}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </>}
+        </div>
+      );
+    };
+
+    /* ── SECTION ADHÉSION ── */
+    const MODES_ADH = ["Espèces","CB","Chèque","Virement","Prélèvement"];
+    const mkAdhForm = () => ({
+      semaine: getCurrentWeekLabel(),
+      indiv_Espèces:"", indiv_CB:"", indiv_Chèque:"", indiv_Virement:"", indiv_Prélèvement:"",
+      struc_Espèces:"", struc_CB:"", struc_Chèque:"", struc_Virement:"", struc_Prélèvement:"",
+    });
+
+    const SectionAdhesion = ({ cafe }) => {
+      const [rows,setRows]   = useState([]);
+      const [form,setForm]   = useState(mkAdhForm());
+      const [loading,setLoading] = useState(true);
+      const [confirmId,setConfirmId] = useState(null);
+
+      useEffect(()=>{ loadData(cafe,"adhesion").then(d=>{ setRows(d); setLoading(false); }); },[cafe]);
+
+      const totalIndiv = MODES_ADH.reduce((s,m)=>s+(parseFloat(form[`indiv_${m}`])||0),0);
+      const totalStruc = MODES_ADH.reduce((s,m)=>s+(parseFloat(form[`struc_${m}`])||0),0);
+
+      const submit = async () => {
+        if (!form.semaine) return;
+        const nr = {
+          id: Date.now(),
+          semaine: form.semaine,
+          mois: (() => { const w=WEEKS_2026.find(w=>w.label===form.semaine); return w ? w.start.getMonth()+1 : null; })(),
+          date: (() => { const w=WEEKS_2026.find(w=>w.label===form.semaine); return w ? w.start.toISOString().slice(0,10) : ""; })(),
+        };
+        MODES_ADH.forEach(m=>{
+          nr[`indiv_${m}`] = parseFloat(form[`indiv_${m}`])||0;
+          nr[`struc_${m}`] = parseFloat(form[`struc_${m}`])||0;
+        });
+        nr.total_indiv = totalIndiv;
+        nr.total_struc = totalStruc;
+        nr.total       = totalIndiv + totalStruc;
+        const upd = [nr,...rows];
+        setRows(upd);
+        await saveData(cafe,"adhesion",upd);
+        setForm(mkAdhForm());
+      };
+
+      const del = async (id) => { const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"adhesion",u); setConfirmId(null); };
+
+      if(loading) return <div className="p-8 text-center text-gray-400">Chargement...</div>;
+
+      return (
+        <div className="space-y-6">
+          {confirmId&&<ConfirmDialog msg="Confirmez-vous vouloir supprimer cette ligne ?" onOui={()=>del(confirmId)} onNon={()=>setConfirmId(null)}/>}
+
+          {/* Titre informatif */}
+          <div className="bg-amber-50 border border-amber-200 rounded-2xl px-5 py-3 flex items-start gap-3">
+            <span className="text-amber-500 text-lg mt-0.5">ℹ️</span>
+            <div>
+              <p className="font-semibold text-amber-800 text-sm">🤝 Adhésions</p>
+              <p className="text-xs text-amber-700 mt-0.5">Renseignements portés ici à titre informatif. Ces montants sont remontés dans les dashboards et le P&L.</p>
+            </div>
+          </div>
+
+          {/* Formulaire */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-4">Nouvelle saisie</h3>
+            <div className="mb-4">
+              <label className="text-xs text-gray-500 block mb-1">Semaine</label>
+              <select value={form.semaine} onChange={e=>setForm(f=>({...f,semaine:e.target.value}))}
+                className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                {WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}
+              </select>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm mb-4">
+                <thead><tr className="bg-gray-50">
+                  <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">Type</th>
+                  {MODES_ADH.map(m=><th key={m} className="text-center px-2 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">{m}</th>)}
+                  <th className="text-right px-3 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">Total</th>
+                </tr></thead>
+                <tbody>
+                  {[["Individuelles","indiv"],["Structure","struc"]].map(([lbl,pfx])=>(
+                    <tr key={pfx} className="border-t border-gray-50">
+                      <td className="px-3 py-2 font-medium text-gray-700">{lbl}</td>
+                      {MODES_ADH.map(m=>(
+                        <td key={m} className="px-2 py-2">
+                          <input type="number" step="0.5" min="0" placeholder="0"
+                            value={form[`${pfx}_${m}`]}
+                            onChange={e=>setForm(f=>({...f,[`${pfx}_${m}`]:e.target.value}))}
+                            className="w-20 border border-gray-200 rounded-lg px-2 py-1.5 text-sm text-center focus:outline-none focus:ring-2 focus:ring-indigo-300"/>
+                        </td>
+                      ))}
+                      <td className="px-3 py-2 text-right font-bold text-indigo-700">
+                        {(pfx==="indiv"?totalIndiv:totalStruc).toFixed(2)} €
+                      </td>
+                    </tr>
+                  ))}
+                  <tr className="border-t-2 border-gray-200 bg-gray-50">
+                    <td className="px-3 py-2 font-bold text-gray-800">TOTAL</td>
+                    {MODES_ADH.map(m=>{
+                      const v=(parseFloat(form[`indiv_${m}`])||0)+(parseFloat(form[`struc_${m}`])||0);
+                      return <td key={m} className="px-2 py-2 text-center font-semibold text-gray-700">{v>0?`${v.toFixed(2)}€`:"—"}</td>;
+                    })}
+                    <td className="px-3 py-2 text-right font-bold text-indigo-800">{(totalIndiv+totalStruc).toFixed(2)} €</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <button onClick={submit} className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 rounded-xl text-sm font-semibold transition-colors">
+              ✅ Enregistrer
+            </button>
+          </div>
+
+          {/* Historique */}
+          <div className="overflow-x-auto rounded-xl border border-gray-100 shadow-sm">
+            <table className="w-full text-sm">
+              <thead><tr className="bg-gray-50">
+                {["Semaine","Indiv. total","Struc. total","Total","Suppr."].map((h,i)=><th key={i} className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>)}
+              </tr></thead>
+              <tbody>
+                {rows.length===0
+                  ? <tr><td colSpan={5} className="text-center py-8 text-gray-400 text-sm">Aucune donnée</td></tr>
+                  : rows.map((r,i)=>(
+                    <tr key={i} className="border-t border-gray-50 hover:bg-gray-50">
+                      <td className="px-3 py-2 font-medium text-gray-700">{r.semaine}</td>
+                      <td className="px-3 py-2 text-indigo-600">{r.total_indiv?.toFixed(2)} €</td>
+                      <td className="px-3 py-2 text-indigo-600">{r.total_struc?.toFixed(2)} €</td>
+                      <td className="px-3 py-2 font-bold text-indigo-800">{r.total?.toFixed(2)} €</td>
+                      <td className="px-3 py-2"><button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button></td>
+                    </tr>
+                  ))
+                }
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    };
+
+    /* ── SECTION COMPTE MONNAIE ── */
+    const PIECES = [
+      {label:"0.10 €",val:0.10},{label:"0.20 €",val:0.20},{label:"0.50 €",val:0.50},
+      {label:"1 €",val:1},{label:"2 €",val:2},{label:"5 €",val:5},
+      {label:"10 €",val:10},{label:"20 €",val:20},{label:"50 €",val:50},
+      {label:"100 €",val:100},{label:"200 €",val:200},
+    ];
+    const SectionMonnaie = ({ cafe }) => {
+      const [periode,setPeriode]=useState("day");
+      const [dateJ,setDateJ]=useState(new Date().toISOString().slice(0,10));
+      const [sw,setSw]=useState(getCurrentWeekLabel());
+      const [encaisse,setEncaisse]=useState({CB:0,Espèces:0,Chèque:0,Virement:0});
+      const [qtes,setQtes]=useState(Object.fromEntries(PIECES.map(p=>[p.label,0])));
+      const [loading,setLoading]=useState(false);
+
+      useEffect(()=>{
+        setLoading(true);
+        Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons")]).then(([ct,tc,dn])=>{
+          const filterFn = r => {
+            if(!r.date) return false;
+            if(periode==="day") return r.date===dateJ;
+            return r.semaine===sw;
+          };
+          const sumMode=(arr,key="prix_total")=> MODES.reduce((acc,m)=>({...acc,[m]:acc[m]+(arr.filter(r=>filterFn(r)&&r.mode===m).reduce((s,r)=>s+(parseFloat(r[key])||0),0))}),{CB:0,Espèces:0,Chèque:0,Virement:0});
+          const taE=sumMode(ct,"prix_total"), tcE=sumMode(tc,"montant"), dnE=sumMode(dn,"montant");
+          setEncaisse(MODES.reduce((acc,m)=>({...acc,[m]:(taE[m]||0)+(tcE[m]||0)+(dnE[m]||0)}),{}));
+          setLoading(false);
+        });
+      },[cafe,periode,dateJ,sw]);
+
+      const totalMonnaie=PIECES.reduce((s,p)=>s+(qtes[p.label]||0)*p.val,0);
+      const totalEncaisse=Object.values(encaisse).reduce((a,b)=>a+b,0);
+      const ecart=totalMonnaie-(encaisse["Espèces"]||0);
+
+      return (
+        <div className="space-y-6">
+          {/* Période */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-4">💰 Compte Monnaie</h3>
+            <div className="flex flex-wrap gap-3 items-end mb-4">
+              <div className="flex gap-2">
+                <button onClick={()=>setPeriode("day")} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${periode==="day"?"bg-amber-500 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>Jour</button>
+                <button onClick={()=>setPeriode("week")} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${periode==="week"?"bg-amber-500 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>Semaine</button>
+              </div>
+              {periode==="day"&&<input type="date" value={dateJ} onChange={e=>setDateJ(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300"/>}
+              {periode==="week"&&<select value={sw} onChange={e=>setSw(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300">{WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}</select>}
+            </div>
+            {/* Encaissé par mode */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-2">
+              {MODES.map(m=><div key={m} className="bg-gray-50 rounded-xl p-3 text-center"><p className="text-xs text-gray-500 mb-1">{m}</p><p className="font-bold text-gray-800">{(encaisse[m]||0).toFixed(2)} €</p></div>)}
+            </div>
+            <div className="text-right text-sm text-gray-500">Total encaissé Espèces : <strong className="text-gray-800">{(encaisse["Espèces"]||0).toFixed(2)} €</strong></div>
+          </div>
+
+          {/* Comptage monnaie */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-4">🪙 Comptage de la caisse</h3>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+              {PIECES.map(p=>(
+                <div key={p.label} className="flex items-center gap-2 bg-gray-50 rounded-xl px-3 py-2">
+                  <span className="text-sm font-medium text-gray-700 w-16 flex-shrink-0">{p.label}</span>
+                  <input type="number" min="0" value={qtes[p.label]||""} placeholder="0"
+                    onChange={e=>setQtes(q=>({...q,[p.label]:Math.max(0,parseInt(e.target.value)||0)}))}
+                    className="w-16 border border-gray-200 rounded-lg px-2 py-1 text-sm text-center focus:outline-none focus:ring-2 focus:ring-amber-300"/>
+                  <span className="text-xs text-gray-400 ml-1">= {((qtes[p.label]||0)*p.val).toFixed(2)}€</span>
+                </div>
+              ))}
+            </div>
+            <button onClick={()=>setQtes(Object.fromEntries(PIECES.map(p=>[p.label,0])))} className="mt-3 text-xs text-gray-400 hover:text-gray-600">Réinitialiser</button>
+          </div>
+
+          {/* Totaux */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <div className="grid grid-cols-3 gap-4">
+              <div className="text-center p-4 bg-amber-50 rounded-2xl">
+                <p className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Total en caisse</p>
+                <p className="text-2xl font-bold text-amber-700">{totalMonnaie.toFixed(2)} €</p>
+              </div>
+              <div className="text-center p-4 bg-emerald-50 rounded-2xl">
+                <p className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Encaissé Espèces</p>
+                <p className="text-2xl font-bold text-emerald-700">{(encaisse["Espèces"]||0).toFixed(2)} €</p>
+              </div>
+              <div className={`text-center p-4 rounded-2xl ${Math.abs(ecart)<0.01?"bg-gray-50":ecart>0?"bg-emerald-50":"bg-rose-50"}`}>
+                <p className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Écart</p>
+                <p className={`text-2xl font-bold ${Math.abs(ecart)<0.01?"text-gray-600":ecart>0?"text-emerald-700":"text-rose-700"}`}>{ecart>=0?"+":""}{ecart.toFixed(2)} €</p>
+              </div>
+            </div>
+          </div>
         </div>
       );
     };
@@ -929,7 +1305,7 @@
     /* ── MAIN APP ── */
     const TABS = [
       {id:"dashboard",label:"📊 Dashboard"},{id:"caisseta",label:"🍺 Caisse TA"},{id:"tcam",label:"🏠 TCAM"},
-      {id:"dons",label:"💝 Dons"},{id:"achats",label:"🛒 Achats"},{id:"privatisation",label:"🎉 Privat."},{id:"carte",label:"🃏 Carte"},
+      {id:"dons",label:"💝 Dons"},{id:"achats",label:"🛒 Achats"},{id:"privatisation",label:"🎉 Privat."},{id:"carte",label:"🃏 Carte"},{id:"monnaie",label:"💰 Monnaie"},{id:"adhesion",label:"🤝 Adhésion"},
     ];
 
     function App() {
@@ -1032,6 +1408,8 @@
                   :tab==="achats"        ?<SectionAchats cafe={activeCafe}/>
                   :tab==="privatisation" ?<SectionPrivatisation cafe={activeCafe}/>
                   :tab==="carte"         ?<SectionCarte cafe={activeCafe} carte={carte} setCarte={setCarte}/>
+                  :tab==="monnaie"       ?<SectionMonnaie cafe={activeCafe}/>
+                  :tab==="adhesion"      ?<SectionAdhesion cafe={activeCafe}/>
                   :null
                 }
               </>
