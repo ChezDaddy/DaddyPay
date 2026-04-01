@@ -21,14 +21,54 @@
 
     /* ── SUPABASE ── */
     const SUPA_URL = "https://hhxuumexyvoxomoarmul.supabase.co";
-    const SUPA_KEY = "sb_publishable_k-fu1nVc1vY_8w7TBr6ilA_2I9GXQH7";
+    const SUPA_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhoeHV1bWV4eXZveG9tb2FybXVsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwMjEzNTIsImV4cCI6MjA5MDU5NzM1Mn0.ifBaeLJVr1e9qJonZdGB9XqaWXXYrn5vJUrvw72NRqw";
+    const SUPA_TIMEOUT = 8000; // 8s max par requête
+
     const supaFetch = async (path, opts={}) => {
-      const r = await fetch(SUPA_URL + path, {
-        ...opts,
-        headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY, "Content-Type": "application/json", "Prefer": "return=representation", ...(opts.headers||{}) }
-      });
-      if (!r.ok) { const t = await r.text(); console.error("Supabase error", r.status, t); return null; }
-      return r.json();
+      const controller = new AbortController();
+      const timer = setTimeout(()=>controller.abort(), SUPA_TIMEOUT);
+      try {
+        const r = await fetch(SUPA_URL + path, {
+          ...opts,
+          signal: controller.signal,
+          headers: { "apikey": SUPA_KEY, "Authorization": "Bearer " + SUPA_KEY,
+            "Content-Type": "application/json", "Prefer": "return=representation",
+            ...(opts.headers||{}) }
+        });
+        clearTimeout(timer);
+        if (!r.ok) { const t = await r.text(); console.error("Supabase error", r.status, t); return null; }
+        // 204 No Content (succès sans body)
+        if (r.status === 204) return true;
+        return r.json();
+      } catch(e) {
+        clearTimeout(timer);
+        console.error("supaFetch error:", e.message);
+        return null;
+      }
+    };
+
+    /* File d'attente pour les sauvegardes ratées — retry en arrière-plan */
+    const _saveQueue = [];
+    let _saveRunning = false;
+    const _flushQueue = async () => {
+      if (_saveRunning || _saveQueue.length===0) return;
+      _saveRunning = true;
+      while (_saveQueue.length > 0) {
+        const {cafe, section, data, resolve} = _saveQueue[0];
+        const res = await supaFetch("/rest/v1/daddy_data", {
+          method: "POST",
+          headers: { "Prefer": "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
+        });
+        if (res !== null) {
+          _saveQueue.shift();
+          resolve(true);
+        } else {
+          // Réessayer dans 5s
+          await new Promise(r=>setTimeout(r,5000));
+        }
+      }
+      _saveRunning = false;
     };
 
     /* ── AUTH ── */
@@ -265,37 +305,54 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     };
     const getWeekForDate  = (s) => { if (!s) return ""; const d = new Date(s); for (const w of WEEKS_2026) { if (d >= w.start && d <= w.end) return w.label; } return ""; };
     const getMonthForDate = (s) => { if (!s) return null; return new Date(s).getMonth() + 1; };
-    /* ── Cache mémoire Supabase ── */
+    /* ── Cache mémoire Supabase + fallback localStorage ── */
     const _dataCache = new Map();
+    const _lsKey = (cafe, section) => `daddy_fb_${cafe}_${section}`;
+
     const loadData = async (cafe, section) => {
       const k = cafe + ":" + section;
       if (_dataCache.has(k)) return _dataCache.get(k);
       try {
         const rows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data`);
-        const v = (rows && rows[0]) ? rows[0].data : [];
+        if (rows !== null) {
+          const v = (rows && rows[0]) ? rows[0].data : [];
+          _dataCache.set(k, v);
+          // Mettre à jour le fallback localStorage
+          try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(v)); } catch{}
+          return v;
+        }
+        // Supabase KO → fallback localStorage
+        const fb = localStorage.getItem(_lsKey(cafe,section));
+        const v = fb ? JSON.parse(fb) : [];
         _dataCache.set(k, v);
         return v;
-      } catch { return []; }
+      } catch {
+        const fb = localStorage.getItem(_lsKey(cafe,section));
+        const v = fb ? JSON.parse(fb) : [];
+        _dataCache.set(k, v);
+        return v;
+      }
     };
+
     const saveData = async (cafe, section, data) => {
       const k = cafe + ":" + section;
       _dataCache.set(k, data);
-      try {
-        const res = await supaFetch("/rest/v1/daddy_data", {
-          method: "POST",
-          headers: { "Prefer": "resolution=merge-duplicates,return=minimal" },
-          body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
-        });
-        if (res === null) { // supaFetch retourne null si !r.ok
-          window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
-          return false;
-        }
-        return true;
-      } catch (e) {
-        console.error(e);
+      // Toujours sauvegarder en localStorage en premier (instantané)
+      try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(data)); } catch{}
+      // Puis Supabase
+      const res = await supaFetch("/rest/v1/daddy_data", {
+        method: "POST",
+        headers: { "Prefer": "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
+      });
+      if (res === null) {
+        // Mise en file d'attente pour retry automatique
+        await new Promise(resolve => { _saveQueue.push({cafe, section, data, resolve}); });
+        _flushQueue();
         window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
         return false;
       }
+      return true;
     };
     const invalidateCache = (cafe, section) => { _dataCache.delete(cafe + ":" + section); };
 
@@ -1025,10 +1082,11 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     };
 
     /* ── DASHBOARD GLOBAL ── */
-    const DashboardGlobal = ({ cafes, onCafeCreated, isAdmin }) => {
+    const DashboardGlobal = ({ cafes, onCafeCreated, isAdmin, initialSubTab="dashboard", onSubTabChange=()=>{} }) => {
       const [allCafesData,setAllCafesData]=useState({}); const [loading,setLoading]=useState(true);
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
-      const [subTab,setSubTab]=useState("dashboard");
+      const [subTab,setSubTab]=useState(initialSubTab);
+      useEffect(()=>{ if(initialSubTab!==subTab) setSubTab(initialSubTab); },[initialSubTab]);
 
       const cafesKeyRef = useRef(null);
       const [refreshTick, setRefreshTick] = useState(0);
@@ -1055,8 +1113,8 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       return (
         <div className="space-y-6">
           {isAdmin&&<div className="flex gap-2">
-            <button onClick={()=>setSubTab("dashboard")} style={subTab==="dashboard"?{backgroundColor:ADMIN_COLOR,color:"white"}:{}} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${subTab==="dashboard"?"":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>📊 Dashboard global</button>
-            <button onClick={()=>setSubTab("admin")} style={subTab==="admin"?{backgroundColor:ADMIN_COLOR,color:"white"}:{}} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${subTab==="admin"?"":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>⚙️ Administration</button>
+            <button onClick={()=>{ setSubTab("dashboard"); onSubTabChange("dashboard"); }} style={subTab==="dashboard"?{backgroundColor:ADMIN_COLOR,color:"white"}:{}} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${subTab==="dashboard"?"":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>📊 Dashboard global</button>
+            <button onClick={()=>{ setSubTab("admin"); onSubTabChange("admin"); }} style={subTab==="admin"?{backgroundColor:ADMIN_COLOR,color:"white"}:{}} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${subTab==="admin"?"":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>⚙️ Administration</button>
           </div>}
           {subTab==="admin"?<AdminPanel cafes={cafes} onCafeCreated={onCafeCreated}/>:<>
             {/* filtres */}
@@ -1631,6 +1689,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       const [globalView,setGlobalView] = useState(false);
       const [rcEnabled,setRcEnabled] = useState(()=>loadRCEnabled());
       const [saveError,setSaveError] = useState(null);
+      const [subTabAdmin,setSubTabAdmin] = useState("dashboard"); // "dashboard" ou "admin"
 
       // Refresh RC state when café changes or admin toggles
       useEffect(()=>{ setRcEnabled(loadRCEnabled()); },[]);
@@ -1663,7 +1722,11 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
         loadData(activeCafe,"carte").then(saved=>{ setCarte(saved&&saved.length>0?saved:DEFAULT_CARTE); setCarteLoaded(true); });
       },[activeCafe, cafeRefreshTick]);
 
-      if(!session) return <LoginScreen onLogin={s=>{setSession(s);setSelCafe(s.role==="admin"?cafes[0]:s.cafe);}}/>;
+      if(!session) return <LoginScreen onLogin={s=>{
+        setSession(s);
+        if(s.role==="admin") { setGlobalView(true); setSubTabAdmin("admin"); }
+        else setSelCafe(s.cafe);
+      }}/>;
 
       const cafeColor = getCafeColor(activeCafe||cafes[0], cafes);
 
@@ -1687,7 +1750,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                 </div>
                 <div className="flex items-center gap-2">
                   {/* Vue globale */}
-                  <button onClick={()=>{setGlobalView(v=>!v);setMenuOpen(false);}} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-colors border ${globalView?"bg-white/30 border-white":"bg-white/15 hover:bg-white/25 border-white/30"}`}>
+                  <button onClick={()=>{setGlobalView(v=>{if(v)setSubTabAdmin("dashboard");return !v;});setMenuOpen(false);}} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-colors border ${globalView?"bg-white/30 border-white":"bg-white/15 hover:bg-white/25 border-white/30"}`}>
                     🌐 <span className="hidden sm:inline">{globalView?"Vue café":"Vue globale"}</span>
                   </button>
                   {/* Sélecteur café (admin seulement, hors vue globale) */}
@@ -1737,7 +1800,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
             {globalView?(
               <>
                 <div className="mb-4 flex items-center gap-2"><span className="inline-block w-3 h-3 rounded-full" style={{backgroundColor:ADMIN_COLOR}}></span><h2 className="text-sm font-semibold text-gray-600">Vue globale — Tous les cafés</h2></div>
-                <DashboardGlobal cafes={cafes} onCafeCreated={setCafes} isAdmin={isAdmin}/>
+                <DashboardGlobal cafes={cafes} onCafeCreated={setCafes} isAdmin={isAdmin} initialSubTab={subTabAdmin} onSubTabChange={setSubTabAdmin}/>
               </>
             ):(
               <>
