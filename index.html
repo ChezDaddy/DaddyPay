@@ -1799,7 +1799,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                 </div>
                 <div className="flex items-center gap-2">
                   {/* Vue globale */}
-                  <button onClick={()=>{setGlobalView(v=>{if(v)setSubTabAdmin("dashboard");return !v;});setMenuOpen(false);}} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-colors border ${globalView?"bg-white/30 border-white":"bg-white/15 hover:bg-white/25 border-white/30"}`}>
+                  <button onClick={()=>{setGlobalView(v=>!v);setMenuOpen(false);}} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-colors border ${globalView?"bg-white/30 border-white":"bg-white/15 hover:bg-white/25 border-white/30"}`}>
                     🌐 <span className="hidden sm:inline">{globalView?"Vue café":"Vue globale"}</span>
                   </button>
                   {/* Sélecteur café (admin seulement, hors vue globale) */}
