@@ -4,18 +4,38 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>☕ Daddy'Pay — La solution caisse de Chez Daddy</title>
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Scripts CDN avec versions épinglées -->
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.6/babel.min.js" crossorigin></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; }
     * { box-sizing: border-box; }
+    #loading-screen { position:fixed;inset:0;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;font-family:system-ui; }
+    #loading-screen.hidden { display:none; }
   </style>
 </head>
 <body>
+  <div id="loading-screen">
+    <div style="font-size:2rem;margin-bottom:1rem;">☕</div>
+    <div style="font-size:1.1rem;font-weight:600;color:#B7242B;margin-bottom:0.5rem;">Daddy'Pay</div>
+    <div style="font-size:0.85rem;color:#666;">Chargement en cours…</div>
+    <div id="load-error" style="display:none;margin-top:1rem;color:#dc2626;font-size:0.8rem;text-align:center;max-width:300px;">
+      ❌ Erreur de chargement.<br>Vérifiez votre connexion internet et rechargez la page.
+    </div>
+  </div>
   <div id="root"></div>
+  <script>
+    // Masquer l'écran de chargement une fois React monté
+    window.__dadyPayLoaded = false;
+    setTimeout(function() {
+      if (!window.__dadyPayLoaded) {
+        document.getElementById('load-error').style.display = 'block';
+      }
+    }, 8000); // Si pas chargé en 8s, afficher l'erreur
+  </script>
   <script type="text/babel">
     const { useState, useEffect, useCallback, useRef } = React;
 
@@ -1808,7 +1828,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const isMulti = isAdmin || isOps;
       const activeCafe = isMulti ? (selCafe || cafes[0]) : (session?.cafe || null);
       const rcOn = activeCafe ? (rcEnabled[activeCafe] || false) : false;
-      const TABS = rcOn ? [...TABS_BASE, {id:"restocollective",label:"\u{1F37D}\uFE0F Resto Coll."}] : TABS_BASE;
+      const TABS = rcOn ? [...TABS_BASE, {id:"restocollective",label:"🍽️ Resto Coll."}] : TABS_BASE;
 
       // Supabase status
       useEffect(()=>{
@@ -2005,6 +2025,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<App />);
+    // Masquer l'écran de chargement
+    window.__dadyPayLoaded = true;
+    const ls = document.getElementById('loading-screen');
+    if (ls) ls.classList.add('hidden');
   </script>
 </body>
 </html>
