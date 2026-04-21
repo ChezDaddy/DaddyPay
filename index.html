@@ -4,38 +4,18 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>☕ Daddy'Pay — La solution caisse de Chez Daddy</title>
-  <!-- Scripts CDN avec versions épinglées -->
-  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone@7.23.6/babel.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; }
     * { box-sizing: border-box; }
-    #loading-screen { position:fixed;inset:0;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;font-family:system-ui; }
-    #loading-screen.hidden { display:none; }
   </style>
 </head>
 <body>
-  <div id="loading-screen">
-    <div style="font-size:2rem;margin-bottom:1rem;">☕</div>
-    <div style="font-size:1.1rem;font-weight:600;color:#B7242B;margin-bottom:0.5rem;">Daddy'Pay</div>
-    <div style="font-size:0.85rem;color:#666;">Chargement en cours…</div>
-    <div id="load-error" style="display:none;margin-top:1rem;color:#dc2626;font-size:0.8rem;text-align:center;max-width:300px;">
-      ❌ Erreur de chargement.<br>Vérifiez votre connexion internet et rechargez la page.
-    </div>
-  </div>
   <div id="root"></div>
-  <script>
-    // Masquer l'écran de chargement une fois React monté
-    window.__dadyPayLoaded = false;
-    setTimeout(function() {
-      if (!window.__dadyPayLoaded) {
-        document.getElementById('load-error').style.display = 'block';
-      }
-    }, 8000); // Si pas chargé en 8s, afficher l'erreur
-  </script>
   <script type="text/babel">
     const { useState, useEffect, useCallback, useRef } = React;
 
@@ -366,71 +346,77 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     };
     const getWeekForDate  = (s) => { if (!s) return ""; const d = new Date(s); for (const w of WEEKS_2026) { if (d >= w.start && d <= w.end) return w.label; } return ""; };
     const getMonthForDate = (s) => { if (!s) return null; return new Date(s).getMonth() + 1; };
-    /* ── Supabase direct — pas de cache mémoire (évite les données périmées) ── */
     const _lsKey = (cafe, section) => `daddy_fb_${cafe}_${section}`;
 
-    /* ── Test connexion Supabase au démarrage ── */
-    const SUPA_STATUS_KEY = "daddy_supa_ok";
-    let _supaOk = null; // null=inconnu, true=ok, false=KO
+    /* Cache mémoire : la source de vérité locale.
+       saveData écrit ici en premier → l'UI ne voit jamais de données périmées.
+       loadData lit ici si disponible → pas de rechargement Supabase inutile. */
+    const _memCache = new Map();
 
     const testSupabase = async () => {
       try {
         const r = await supaFetch("/rest/v1/daddy_data?limit=1&select=cafe");
-        if (r !== null) {
-          _supaOk = true;
-          try { localStorage.setItem(SUPA_STATUS_KEY, "ok"); } catch {}
-          window.dispatchEvent(new CustomEvent("supa_status", { detail: { ok: true } }));
-        } else {
-          _supaOk = false;
-          try { localStorage.setItem(SUPA_STATUS_KEY, "ko"); } catch {}
-          window.dispatchEvent(new CustomEvent("supa_status", { detail: { ok: false } }));
-        }
+        window.dispatchEvent(new CustomEvent("supa_status", { detail: { ok: r !== null } }));
       } catch {
-        _supaOk = false;
         window.dispatchEvent(new CustomEvent("supa_status", { detail: { ok: false } }));
       }
     };
-    testSupabase(); // lancer au chargement sans bloquer
+    testSupabase();
 
-    const loadData = async (cafe, section) => {
+    const loadData = async (cafe, section, bypassCache=false) => {
+      const key = cafe + ":" + section;
+      // Utiliser le cache mémoire sauf si on veut forcer un rechargement
+      if (!bypassCache && _memCache.has(key)) return _memCache.get(key);
       try {
-        const rows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data`);
+        const rows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data,updated_at&order=updated_at.desc&limit=1`);
         if (rows !== null) {
-          // rows est un tableau : [{data: [...]}] ou []
-          const v = (Array.isArray(rows) && rows.length > 0 && rows[0].data) ? rows[0].data : [];
-          // Mettre à jour le fallback localStorage
+          const v = (Array.isArray(rows) && rows.length > 0 && rows[0].data != null) ? rows[0].data : [];
+          _memCache.set(key, v);
           try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(v)); } catch{}
           return v;
         }
-        // Supabase KO ou timeout → fallback localStorage
+        // Supabase KO → fallback localStorage
         const fb = localStorage.getItem(_lsKey(cafe,section));
         return fb ? JSON.parse(fb) : [];
-      } catch(e) {
-        console.warn("loadData error", cafe, section, e);
+      } catch {
         const fb = localStorage.getItem(_lsKey(cafe,section));
         return fb ? JSON.parse(fb) : [];
       }
     };
 
     const saveData = async (cafe, section, data) => {
-      // Sauvegarder en localStorage comme backup immédiat
+      const key = cafe + ":" + section;
+      // 1. Cache mémoire immédiat — l'UI ne voit jamais de données périmées
+      _memCache.set(key, data);
+      // 2. localStorage comme backup hors-ligne
       try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(data)); } catch{}
-      // Envoyer à Supabase (upsert merge-duplicates)
-      const res = await supaFetch("/rest/v1/daddy_data", {
-        method: "POST",
-        headers: { "Prefer": "resolution=merge-duplicates,return=minimal" },
-        body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
-      });
-      // res===true signifie 204 No Content (succès upsert), res===null signifie erreur
-      if (res === null) {
+      // 3. Supabase : DELETE puis INSERT (évite les doublons sans contrainte UNIQUE)
+      try {
+        // Supprimer la ligne existante
+        await supaFetch(
+          `/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}`,
+          { method: "DELETE", headers: { "Prefer": "return=minimal" } }
+        );
+        // Insérer la nouvelle version
+        const res = await supaFetch("/rest/v1/daddy_data", {
+          method: "POST",
+          headers: { "Prefer": "return=minimal" },
+          body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
+        });
+        if (res === null) throw new Error("INSERT failed");
+        return true;
+      } catch(e) {
+        console.error("saveData error:", cafe, section, e.message);
         _saveQueue.push({cafe, section, data, resolve: ()=>{}});
         _flushQueue();
         window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
         return false;
       }
-      return true;
     };
-    const invalidateCache = () => {}; // no-op, kept for compatibility
+    const invalidateCache = (cafe, section) => {
+      if (cafe && section) _memCache.delete(cafe+":"+section);
+      else _memCache.clear();
+    };
 
     /* ── PALETTE COULEURS DADDY ── */
     const CAFE_COLORS_LIST = ["#d3692D","#E59E00","#8CADA1","#284351","#D7D0BF","#d3692D","#E59E00","#8CADA1","#284351","#D7D0BF"];
@@ -572,6 +558,8 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
+              <p className="text-center text-xs text-gray-400 mt-3">Build 17/04/2026 17:28</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.1 · Build du 15/04/2026 06:17</p>
             </div>
           </div>
         </div>
@@ -837,8 +825,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const add = (label) => { if(!label)return; const item=carte.find(c=>c.label===label); if(!item)return; setPanier(p=>{const ei=p.findIndex(l=>l.produit===label); if(ei>=0){const c=[...p];c[ei]={...c[ei],qte:c[ei].qte+1};return c;} return [...p,{produit:label,prix_unitaire:item.prix,qte:1,typo:item.type}];}); setSelProd(""); };
       const upd = (i,d)=>setPanier(p=>{const c=[...p];c[i]={...c[i],qte:Math.max(1,c[i].qte+d)};return c;});
       const rem = (i)=>setPanier(p=>p.filter((_,j)=>j!==i));
-      const valider = async()=>{ if(!panier.length||!date)return; const now=Date.now(); const nr=panier.map((l,i)=>({id:now+i,date,semaine:getWeekForDate(date),mois:getMonthForDate(date),produit:l.produit,qte:l.qte,prix_unitaire:l.prix_unitaire,prix_total:parseFloat((l.prix_unitaire*l.qte).toFixed(2)),mode,typo:l.typo})); const upd=[...nr,...rows]; setRows(upd); setPanier([]); await saveData(cafe,"caisseta",upd); loadData(cafe,"caisseta").then(d=>{if(d&&d.length>=0)setRows(d);}); };
-      const del = async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"caisseta",u); loadData(cafe,"caisseta").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const valider = async()=>{ if(!panier.length||!date)return; const now=Date.now(); const nr=panier.map((l,i)=>({id:now+i,date,semaine:getWeekForDate(date),mois:getMonthForDate(date),produit:l.produit,qte:l.qte,prix_unitaire:l.prix_unitaire,prix_total:parseFloat((l.prix_unitaire*l.qte).toFixed(2)),mode,typo:l.typo})); const upd=[...nr,...rows]; setRows(upd); setPanier([]); await saveData(cafe,"caisseta",upd); };
+      const del = async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"caisseta",u); };
+      if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       const softs=carte.filter(c=>c.type==="Soft"), alcools=carte.filter(c=>c.type==="Alcool"), nourr=carte.filter(c=>c.type==="Snacking");
       return (
         <div className="space-y-6">
@@ -888,8 +877,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [f,setF]=useState({date:new Date().toISOString().slice(0,10),evenement:"",pu:"",qte:"",montant:"",mode:"Espèces",commentaire:""});
       useEffect(()=>{loadData(cafe,"tcam").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
       const puV=parseFloat(f.pu)||0, qteV=parseFloat(f.qte)||0, hasC=puV>0&&qteV>0, tot=hasC?parseFloat((puV*qteV).toFixed(2)):(parseFloat(f.montant)||0);
-      const submit=async()=>{ if(!f.evenement||!f.date)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),evenement:f.evenement,pu:puV,qte:qteV||null,montant:tot,mode:f.mode,commentaire:f.commentaire}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,evenement:"",pu:"",qte:"",montant:"",commentaire:""})); await saveData(cafe,"tcam",upd); loadData(cafe,"tcam").then(d=>{if(d&&d.length>=0)setRows(d);}); };
-      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"tcam",u); loadData(cafe,"tcam").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const submit=async()=>{ if(!f.evenement||!f.date)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),evenement:f.evenement,pu:puV,qte:qteV||null,montant:tot,mode:f.mode,commentaire:f.commentaire}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,evenement:"",pu:"",qte:"",montant:"",commentaire:""})); await saveData(cafe,"tcam",upd); };
+      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"tcam",u); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       return (
         <div className="space-y-6">
@@ -922,8 +911,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [confirmId,setConfirmId]=useState(null);
       const [f,setF]=useState({date:new Date().toISOString().slice(0,10),produit:"Don",montant:"",mode:"CB",recu_fiscal:"non",commentaire:""});
       useEffect(()=>{loadData(cafe,"dons").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
-      const submit=async()=>{ if(!f.montant||!f.date)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),produit:f.produit,montant:parseFloat(f.montant),mode:f.mode,recu_fiscal:f.recu_fiscal,commentaire:f.commentaire}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,montant:"",commentaire:""})); await saveData(cafe,"dons",upd); loadData(cafe,"dons").then(d=>{if(d&&d.length>=0)setRows(d);}); };
-      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"dons",u); loadData(cafe,"dons").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const submit=async()=>{ if(!f.montant||!f.date)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),produit:f.produit,montant:parseFloat(f.montant),mode:f.mode,recu_fiscal:f.recu_fiscal,commentaire:f.commentaire}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,montant:"",commentaire:""})); await saveData(cafe,"dons",upd); };
+      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"dons",u); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       return (
         <div className="space-y-6">
@@ -956,8 +945,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [confirmId,setConfirmId]=useState(null);
       const [f,setF]=useState({date:new Date().toISOString().slice(0,10),fournisseur:"",destination:"TCAM+TA",montant:"",mode:"CB",no_facture:"",facture_teams:"non"});
       useEffect(()=>{loadData(cafe,"achats").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
-      const submit=async()=>{ if(!f.fournisseur||!f.montant)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),fournisseur:f.fournisseur,destination:f.destination,montant:parseFloat(f.montant),mode:f.mode,no_facture:f.no_facture,facture_teams:f.facture_teams}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,fournisseur:"",montant:"",no_facture:""})); await saveData(cafe,"achats",upd); loadData(cafe,"achats").then(d=>{if(d&&d.length>=0)setRows(d);}); };
-      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"achats",u); loadData(cafe,"achats").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const submit=async()=>{ if(!f.fournisseur||!f.montant)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),fournisseur:f.fournisseur,destination:f.destination,montant:parseFloat(f.montant),mode:f.mode,no_facture:f.no_facture,facture_teams:f.facture_teams}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,fournisseur:"",montant:"",no_facture:""})); await saveData(cafe,"achats",upd); };
+      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"achats",u); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       return (
         <div className="space-y-6">
@@ -992,7 +981,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [f,setF]=useState({date_evenement:"",client:"",montant_devis:"",devis_accepte:"OUI",montant_facture:"",date_reglement:"",mode:"Chèque"});
       useEffect(()=>{loadData(cafe,"privatisation").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
       const submit=async()=>{ if(!f.client)return; const nr={id:Date.now(),...f,semaine:getWeekForDate(f.date_evenement),mois:getMonthForDate(f.date_evenement),montant_devis:parseFloat(f.montant_devis)||0,montant_facture:parseFloat(f.montant_facture)||0}; const upd=[nr,...rows]; setRows(upd); await saveData(cafe,"privatisation",upd); setF({date_evenement:"",client:"",montant_devis:"",devis_accepte:"OUI",montant_facture:"",date_reglement:"",mode:"Chèque"}); };
-      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"privatisation",u); loadData(cafe,"privatisation").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"privatisation",u); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       return (
         <div className="space-y-6">
@@ -1139,26 +1128,12 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
     /* ── SECTION CARTE ── */
     const TYPES_PRODUIT = ["Soft","Alcool","Snacking","Resto Coll."];
-    const SectionCarte = ({ cafe, carteInitiale, onCarteChange }) => {
-      // Etat local — indépendant du parent pour éviter les races conditions
-      const [localCarte, setLocalCarte] = useState(carteInitiale || []);
-      const [f,setF]=useState({label:"",prix:"",type:"Soft",rcType:"Snacking"}); 
-      const [editId,setEditId]=useState(null); const [ef,setEf]=useState({});
-      const [saving, setSaving]=useState(false);
-
-      // Synchroniser si carteInitiale change (changement de café)
-      useEffect(()=>{ setLocalCarte(carteInitiale || []); }, [cafe]);
-
+    const SectionCarte = ({ cafe, carte, setCarte }) => {
+      const [f,setF]=useState({label:"",prix:"",type:"Soft"}); const [editId,setEditId]=useState(null); const [ef,setEf]=useState({});
       const save=async(upd)=>{
-        setSaving(true);
-        setLocalCarte(upd); // UI immédiate
-        if(onCarteChange) onCarteChange(upd); // remonte au parent
-        const ok = await saveData(cafe,"carte",upd);
-        setSaving(false);
-        if(!ok) console.warn("Carte: sauvegarde Supabase échouée, retry en attente");
+        setCarte(upd);
+        await saveData(cafe,"carte",upd);
       };
-      // On utilise localCarte au lieu de carte (prop)
-      const carte = localCarte;
       const add=async()=>{ if(!f.label||!f.prix)return; const prod={id:`c_${Date.now()}`,label:f.label,prix:parseFloat(f.prix),type:f.type}; if(f.type==="Resto Coll.") prod.rcType=f.rcType||"Snacking"; await save([...carte,prod]); setF({label:"",prix:"",type:"Soft",rcType:"Snacking"}); };
       const saveEdit=async(id)=>{ const upd={...carte.find(c=>c.id===id)||{},label:ef.label,prix:parseFloat(ef.prix),type:ef.type}; if(ef.type==="Resto Coll.") upd.rcType=ef.rcType||"Snacking"; else delete upd.rcType; await save(carte.map(c=>c.id===id?upd:c)); setEditId(null); };
       const del=async(id)=>await save(carte.filter(c=>c.id!==id));
@@ -1169,7 +1144,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       return (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
-            <div className="flex items-center justify-between mb-4"><h3 className="font-semibold text-gray-800">🃏 Ajouter un produit à la carte</h3>{saving&&<span className="text-xs text-blue-600 font-medium">💾 Sauvegarde…</span>}</div>
+            <h3 className="font-semibold text-gray-800 mb-4">🃏 Ajouter un produit à la carte</h3>
             <div className="flex flex-wrap gap-3 items-end">
               <div><label className="text-xs text-gray-500 block mb-1">Nom</label><input type="text" placeholder="Ex: Kombucha…" value={f.label} onChange={e=>setF(x=>({...x,label:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300 w-52"/></div>
               <div><label className="text-xs text-gray-500 block mb-1">Prix (€)</label><input type="number" step="0.5" min="0" value={f.prix} onChange={e=>setF(x=>({...x,prix:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300 w-24"/></div>
@@ -1209,9 +1184,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     /* ── DASHBOARD GLOBAL ── */
     const DashboardGlobal = ({ cafes, onCafeCreated, isAdmin, supaStatus=null, initialSubTab="dashboard", onSubTabChange=()=>{}, allCafesData={}, allCafesLoading=false, onForceRefresh=()=>{} }) => {
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
-      // subTab contrôlé entièrement par le parent via initialSubTab
-      const subTab = initialSubTab;
-      const setSubTab = onSubTabChange; // toute modification remonte au parent
+      const [subTab,setSubTab]=useState(initialSubTab);
+      useEffect(()=>{ if(initialSubTab!==subTab) setSubTab(initialSubTab); },[initialSubTab]);
 
       const loading = allCafesLoading;
       const forceRefresh = onForceRefresh;
@@ -1219,22 +1193,39 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
 
-      const stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{caisseta:[],tcam:[],dons:[],achats:[],privatisation:[],adhesion:[],restocollective:[]}; const fTA=fil(d.caisseta),fTC=fil(d.tcam),fD=fil(d.dons),fA=fil(d.achats),fP=fil(d.privatisation),fADH=fil(d.adhesion),fRC=fil(d.restocollective); const ta=sum(fTA),tc=sum(fTC,"montant"),dn=sum(fD,"montant"),ac=sum(fA,"montant"),pv=sum(fP,"montant_facture"),adh=sum(fADH,"total"),rc=sum(fRC,"prix_total"); return{cafe,ta,tc,dn,ac,pv,adh,rc,total:ta+tc+dn+pv+adh+rc,fTA,fTC,fD,fADH}; });
-      const GT=stats.reduce((s,c)=>({ta:s.ta+c.ta,tc:s.tc+c.tc,dn:s.dn+c.dn,ac:s.ac+c.ac,pv:s.pv+c.pv,adh:s.adh+c.adh,rc:s.rc+c.rc,total:s.total+c.total}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0});
+      const safeArr = a => Array.isArray(a) ? a : [];
+      const stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=fil(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=sum(fTA),tc=sum(fTC,"montant"),dn=sum(fD,"montant"),ac=sum(fA,"montant"),pv=sum(fP,"montant_facture"),adh=sum(fADH,"total"),rc=sum(fRC,"prix_total"); return{cafe,ta:n(ta),tc:n(tc),dn:n(dn),ac:n(ac),pv:n(pv),adh:n(adh),rc:n(rc),total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH}; });
+      const n = v => (typeof v==='number' && isFinite(v)) ? v : 0;
+      const GT=stats.reduce((s,c)=>({ta:s.ta+n(c.ta),tc:s.tc+n(c.tc),dn:s.dn+n(c.dn),ac:s.ac+n(c.ac),pv:s.pv+n(c.pv),adh:s.adh+n(c.adh),rc:s.rc+n(c.rc),total:s.total+n(c.total)}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0});
 
       const weekly=WEEKS_2026.slice(0,20).map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); }); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh}; }).filter(r=>r.ta+r.tc+r.dn+r.ac+r.adh>0);
 
       const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ if(!r.date)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),TVA:"",...r}))); explodeAdhesion((d.adhesion||[]).filter(fn),c).forEach(r=>rows.push({...r,TVA:""})); (d.restocollective||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:"RESTOCOLLECTIVE",TVA:r.tva_total?.toFixed(2)||"",...r})); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
 
+
+
+      // Ne pas render le dashboard tant que les données ne sont pas chargées
+      if (allCafesLoading && Object.keys(allCafesData).length === 0) {
+        return <div className="p-12 text-center">
+          <div className="text-4xl mb-4">⏳</div>
+          <p className="text-gray-500 font-medium">Chargement des données de tous les cafés…</p>
+        </div>;
+      }
+
+      if (allCafesLoading && Object.keys(allCafesData).length===0) {
+        return <div className="p-12 text-center text-gray-400">
+          <div className="text-3xl mb-3">⏳</div>
+          <p>Chargement des données…</p>
+        </div>;
+      }
+
       return (
         <div className="space-y-6">
-          {allCafesLoading&&<div className="bg-blue-50 border border-blue-200 rounded-xl px-4 py-2 text-sm text-blue-700 flex items-center gap-2">⏳ Chargement des données…</div>}
           {isAdmin&&<div className="flex gap-2">
             <button onClick={()=>{ setSubTab("dashboard"); onSubTabChange("dashboard"); }} style={subTab==="dashboard"?{backgroundColor:ADMIN_COLOR,color:"white"}:{}} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${subTab==="dashboard"?"":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>📊 Dashboard global</button>
             <button onClick={()=>{ setSubTab("admin"); onSubTabChange("admin"); }} style={subTab==="admin"?{backgroundColor:ADMIN_COLOR,color:"white"}:{}} className={`px-4 py-2 rounded-xl text-sm font-semibold transition-colors ${subTab==="admin"?"":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>⚙️ Administration</button>
           </div>}
-          {subTab==="admin"&&isAdmin?<AdminPanel cafes={cafes} onCafeCreated={onCafeCreated} supaStatus={supaStatus}/>
-          :loading?<div className="p-12 text-center text-gray-400">⏳ Chargement de tous les cafés…</div>:<>
+          {subTab==="admin"&&isAdmin?<AdminPanel cafes={cafes} onCafeCreated={onCafeCreated} supaStatus={supaStatus}/>:<>
             {/* filtres */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex flex-wrap gap-3 items-center justify-between">
               <div className="flex gap-2 flex-wrap">
@@ -1308,7 +1299,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             {/* Récap hebdo */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">Récap. hebdomadaire — tous cafés</h4>
               {weekly.length===0?<p className="text-sm text-gray-400 text-center py-6">Aucune donnée</p>:<div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
-              <tbody>{weekly.map(r=><tr key={r.week} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{r.week}</td><td className="px-3 py-2 text-emerald-600">{r.ta.toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">{r.tc.toFixed(2)} €</td><td className="px-3 py-2 text-rose-600">{r.dn.toFixed(2)} €</td><td className="px-3 py-2 text-indigo-600">{r.adh.toFixed(2)} €</td><td className="px-3 py-2 text-sky-600">−{r.ac.toFixed(2)} €</td><td className="px-3 py-2 font-bold text-gray-800">{r.total.toFixed(2)} €</td></tr>)}</tbody></table></div>}
+              <tbody>{weekly.map(r=><tr key={r.week} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{r.week}</td><td className="px-3 py-2 text-emerald-600">{(r.ta||0).toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">{(r.tc||0).toFixed(2)} €</td><td className="px-3 py-2 text-rose-600">{(r.dn||0).toFixed(2)} €</td><td className="px-3 py-2 text-indigo-600">{(r.adh||0).toFixed(2)} €</td><td className="px-3 py-2 text-sky-600">−{(r.ac||0).toFixed(2)} €</td><td className="px-3 py-2 font-bold text-gray-800">{(r.total||0).toFixed(2)} €</td></tr>)}</tbody></table></div>}
             </div>
             {/* ── PNL ANNUEL GLOBAL ── */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
@@ -1406,7 +1397,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         setForm(mkAdhForm());
       };
 
-      const del = async (id) => { setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"adhesion",u); loadData(cafe,"adhesion").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const del = async (id) => { setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"adhesion",u); };
 
       if(loading) return <div className="p-8 text-center text-gray-400">Chargement...</div>;
 
@@ -1677,10 +1668,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const upd=[...nr,...rows]; setRows(upd);
         setPanier([]);
         await saveData(cafe,"restocollective",upd);
-        loadData(cafe,"restocollective").then(d=>{if(d&&d.length>=0)setRows(d);});
+       
       };
 
-      const del = async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"restocollective",u); loadData(cafe,"restocollective").then(d=>{if(d&&d.length>=0)setRows(d);}); };
+      const del = async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"restocollective",u); };
 
       if(loading) return <div className="p-8 text-center text-gray-400">Chargement...</div>;
 
@@ -1809,9 +1800,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [carteLoaded,setCarteLoaded] = useState(false);
       const [menuOpen,setMenuOpen]   = useState(false);
       const [globalView,setGlobalView] = useState(()=>{
-        // Si une session admin/ops est déjà persistée, démarrer en vue globale
         const s = loadSession();
-        return s?.role === "admin" || s?.role === "operations";
+        return s?.role==="admin" || s?.role==="operations";
       });
       const [rcEnabled,setRcEnabled] = useState({});
       const [saveError,setSaveError] = useState(null);
@@ -1828,7 +1818,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const isMulti = isAdmin || isOps;
       const activeCafe = isMulti ? (selCafe || cafes[0]) : (session?.cafe || null);
       const rcOn = activeCafe ? (rcEnabled[activeCafe] || false) : false;
-      const TABS = rcOn ? [...TABS_BASE, {id:"restocollective",label:"🍽️ Resto Coll."}] : TABS_BASE;
+      const TABS = rcOn ? [...TABS_BASE, {id:"restocollective",label:"\u{1F37D}\uFE0F Resto Coll."}] : TABS_BASE;
 
       // Supabase status
       useEffect(()=>{
@@ -1837,8 +1827,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         return () => window.removeEventListener("supa_status", h);
       }, []);
 
-      // RC : charger depuis Supabase au démarrage + écouter les updates
+      // RC updates + initial load from Supabase
       useEffect(()=>{
+        // Charger depuis Supabase au démarrage pour synchroniser entre navigateurs
         loadRCEnabledFromSupabase().then(r => setRcEnabled(r || {}));
         const h = () => loadRCEnabledFromSupabase().then(r => setRcEnabled(r || {}));
         window.addEventListener("rc_updated", h);
@@ -1860,19 +1851,17 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         if (session?.role === "admin") checkAndSendAutoReports(cafes).catch(()=>{});
       }, [session]);
 
-      // Load carte when cafe changes (clé unique par café + tick)
-      const carteKeyRef = useRef(null);
+      // Load carte uniquement quand le café change
+      // (pas au cafeRefreshTick — le cache mémoire garantit la cohérence locale)
       useEffect(()=>{
         if (!activeCafe) return;
-        const key = activeCafe + ":" + cafeRefreshTick;
-        if (carteKeyRef.current === key) return; // déjà chargé pour ce café/tick
-        carteKeyRef.current = key;
         setCarteLoaded(false);
+        // bypassCache=true si on vient d'un 🔄 explicite (géré via invalidateCache)
         loadData(activeCafe, "carte").then(saved=>{
           setCarte(saved && saved.length > 0 ? saved : DEFAULT_CARTE);
           setCarteLoaded(true);
         });
-      }, [activeCafe, cafeRefreshTick]);
+      }, [activeCafe]);
 
       // Load all cafes data
       const _loadingRef = useRef(false);
@@ -1906,10 +1895,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
       // Login screen
       if (!session) {
-        return <LoginScreen onLogin={s=>{
+                        return <LoginScreen onLogin={s=>{
           setSession(s);
-          if (s.role === "admin" || s.role === "operations") {
-            setSelCafe(cafes[0] || null);
+          if(s.role==="admin" || s.role==="operations") {
+            setSelCafe(cafes[0]||null);
             setSubTabAdmin("dashboard");
             setGlobalView(true);
           } else {
@@ -1919,7 +1908,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         }}/>;
       }
 
-      const forceRefreshCafe = () => setCafeRefreshTick(t=>t+1);
+      const forceRefreshCafe = () => {
+        if (activeCafe) {
+          ["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective","carte"]
+            .forEach(s => invalidateCache(activeCafe, s));
+        }
+        setCafeRefreshTick(t=>t+1);
+      };
 
       const headerStyle = (globalView || isAdmin)
         ? { background: `linear-gradient(to right, ${ADMIN_COLOR}, #8B1a1f)` }
@@ -1941,9 +1936,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 </div>
                 <div className="flex items-center gap-2">
                   {/* Vue globale */}
-                  <button onClick={()=>{setGlobalView(v=>!v);setMenuOpen(false);}} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-colors border ${globalView?"bg-white/30 border-white":"bg-white/15 hover:bg-white/25 border-white/30"}`}>
+                  {isMulti&&<button onClick={()=>{setGlobalView(v=>!v);setMenuOpen(false);}} className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-sm font-semibold transition-colors border ${globalView?"bg-white/30 border-white":"bg-white/15 hover:bg-white/25 border-white/30"}`}>
                     🌐 <span className="hidden sm:inline">{globalView?"Vue café":"Vue globale"}</span>
-                  </button>
+                  </button>}
                   {/* Sélecteur café (admin + opérations, hors vue globale) */}
                   {isMulti&&!globalView&&(
                     <div className="relative">
@@ -2010,7 +2005,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   :tab==="dons"          ?<SectionDons cafe={activeCafe} refreshTick={cafeRefreshTick}/>
                   :tab==="achats"        ?<SectionAchats cafe={activeCafe} refreshTick={cafeRefreshTick}/>
                   :tab==="privatisation" ?<SectionPrivatisation cafe={activeCafe} refreshTick={cafeRefreshTick}/>
-                  :tab==="carte"         ?<SectionCarte cafe={activeCafe} carteInitiale={carte} onCarteChange={setCarte}/>
+                  :tab==="carte"         ?<SectionCarte cafe={activeCafe} carte={carte} setCarte={setCarte}/>
                   :tab==="monnaie"       ?<SectionMonnaie cafe={activeCafe}/>
                   :tab==="adhesion"      ?<SectionAdhesion cafe={activeCafe} refreshTick={cafeRefreshTick}/>
                   :tab==="restocollective"?<SectionRestoCollective cafe={activeCafe} carte={carte} refreshTick={cafeRefreshTick}/>
@@ -2025,10 +2020,6 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<App />);
-    // Masquer l'écran de chargement
-    window.__dadyPayLoaded = true;
-    const ls = document.getElementById('loading-screen');
-    if (ls) ls.classList.add('hidden');
   </script>
 </body>
 </html>
