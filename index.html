@@ -127,6 +127,9 @@
       return loadRCEnabled();
     };
     const TVA_RATES = { Snacking: 0.10, Soft: 0.20, Alcool: 0.20 };
+    // Taux RC simplifiés : clé = taux en %, valeur = taux décimal
+    const RC_TVA_RATES = { "0": 0, "5.5": 0.055, "10": 0.10, "20": 0.20 };
+    const getRCTaux = (rcType) => RC_TVA_RATES[rcType] ?? RC_TVA_RATES["10"];
 
     /* ── EMAILJS CONFIG ── (à renseigner dans le panneau Admin) */
     const EMAILJS_KEY   = "daddy_emailjs";
@@ -156,15 +159,10 @@
 
     /* ── BUILD CSV STRING (sans téléchargement) ── */
     const CSV_COL_ORDER = [
-      "TVA","Café","Section",
-      "date","semaine","mois",
-      "produit","evenement","fournisseur","client",
-      "typo","type","destination",
-      "qte","prix_unitaire","pu",
-      "montant","prix_total","montant_facture","montant_devis",
-      "tva_rate","tva_unitaire","tva_total","ht_unitaire","ht_total",
-      "mode","recu_fiscal","facture_teams","devis_accepte",
-      "no_facture","date_evenement","date_reglement","commentaire","id"
+      "Café","Section","date","semaine","mois",
+      "produit","evenement","fournisseur","typo","destination",
+      "qte","Prix de vente unitaire","HT_PU","tva_taux","tva_unitaire","tva_total","ht_total","montant TTC payé",
+      "mode","facture_teams","no_facture","commentaire","id"
     ];
     const sortedHeaders = (rows) => {
       const allKeys = [...new Set(rows.flatMap(r=>Object.keys(r)))];
@@ -180,14 +178,46 @@
     };
 
     /* ── COLLECT ALL DATA ── */
+    // Normalise une ligne pour le CSV selon les colonnes cibles (spec La Madeleine)
+    const normalizeRow = (r, section) => {
+      const out = {};
+      // Colonnes directes sans renommage
+      ["date","semaine","mois","produit","evenement","fournisseur","typo","destination",
+       "qte","mode","facture_teams","no_facture","commentaire","id"].forEach(k => {
+        if (r[k] !== undefined) out[k] = r[k];
+      });
+
+      // "Prix de vente unitaire" = prix public TTC affiché sur la carte
+      // TA : prix_unitaire | RC : prix (champ carte) | autres : vide
+      const puTTC = r.prix_unitaire ?? r.prix ?? null;
+      if (puTTC !== null) out["Prix de vente unitaire"] = puTTC;
+
+      // Colonnes TVA (uniquement RC)
+      if (r.ht_unitaire  !== undefined) out["HT_PU"]        = r.ht_unitaire;
+      if (r.tva_rate     !== undefined) out["tva_taux"]      = r.tva_rate;
+      if (r.tva_unitaire !== undefined) out["tva_unitaire"]  = r.tva_unitaire;
+      if (r.tva_total    !== undefined) out["tva_total"]     = r.tva_total;
+      if (r.ht_total     !== undefined) out["ht_total"]      = r.ht_total;
+
+      // "montant TTC payé" = pu_TTC * qte pour TA/RC, montant brut pour TCAM/Dons, -montant pour Achats
+      let montantTTC = null;
+      if (section === "caisseta")        montantTTC = r.prix_total ?? null;
+      else if (section === "restocollective") montantTTC = r.prix_total ?? r.montant ?? null;
+      else if (section === "achats")     montantTTC = r.montant != null ? -Math.abs(parseFloat(r.montant)||0) : null;
+      else                               montantTTC = r.montant ?? null; // TCAM, Dons, Privatisation
+      if (montantTTC !== null) out["montant TTC payé"] = montantTTC;
+
+      return out;
+    };
+
     const collectAllData = async (cafes, filterFn) => {
       const rows = [];
       await Promise.all(cafes.map(async cafe => {
         const [ct,tc,dn,ac,pv,adh,rc] = await Promise.all(["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective"].map(s=>loadData(cafe,s)));
         const all = [{s:"caisseta",d:ct},{s:"tcam",d:tc},{s:"dons",d:dn},{s:"achats",d:ac},{s:"privatisation",d:pv}];
-        all.forEach(({s,d})=>d.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:s.toUpperCase(),TVA:"",...r})));
-        explodeAdhesion(adh.filter(filterFn), cafe).forEach(r=>rows.push({...r,TVA:""}));
-        rc.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:"RESTOCOLLECTIVE",TVA:r.tva_total?.toFixed(2)||"",...r}));
+        all.forEach(({s,d})=>d.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:s.toUpperCase(),...normalizeRow(r,s)})));
+        explodeAdhesion(adh.filter(filterFn), cafe).forEach(r=>rows.push({...r}));
+        rc.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:"RESTOCOLLECTIVE",...normalizeRow(r,"restocollective")}));
       }));
       return rows;
     };
@@ -206,7 +236,8 @@
 
     /* ── BUILD SUMMARY TEXT for email ── */
     const buildSummaryText = (rows, cafes, periodLabel) => {
-      const sum = (arr, k) => arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
+      // Les lignes passent par normalizeRow → colonne unifiée "montant TTC payé"
+      const sum = (arr) => arr.reduce((s,r)=>s+(parseFloat(r["montant TTC payé"])||0),0);
       let txt = `☕ Chez Daddy — Rapport ${periodLabel}\n`;
       txt += `Généré le ${new Date().toLocaleDateString("fr-FR")} à ${new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}\n`;
       txt += `Total lignes : ${rows.length}\n\n`;
@@ -214,32 +245,40 @@
       cafes.forEach(cafe => {
         const cr = rows.filter(r=>r.Café===cafe);
         if (!cr.length) return;
-        const ta   = sum(cr.filter(r=>r.Section==="CAISSETA"), "prix_total");
-        const tc   = sum(cr.filter(r=>r.Section==="TCAM"),     "montant");
-        const dn   = sum(cr.filter(r=>r.Section==="DONS"),     "montant");
-        const ac   = sum(cr.filter(r=>r.Section==="ACHATS"),   "montant");
-        const pv   = sum(cr.filter(r=>r.Section==="PRIVATISATION"), "montant_facture");
-        const tot  = ta+tc+dn+pv;
+        const ta   = sum(cr.filter(r=>r.Section==="CAISSETA"));
+        const tc   = sum(cr.filter(r=>r.Section==="TCAM"));
+        const dn   = sum(cr.filter(r=>r.Section==="DONS"));
+        const ac   = Math.abs(sum(cr.filter(r=>r.Section==="ACHATS")));
+        const pv   = sum(cr.filter(r=>r.Section==="PRIVATISATION"));
+        const rc   = sum(cr.filter(r=>r.Section==="RESTOCOLLECTIVE"));
+        const adh  = sum(cr.filter(r=>r.Section==="ADHESION"));
+        const tot  = ta+tc+dn+pv+rc+adh;
         txt += `\n${cafe}\n`;
         txt += `  TA         : ${ta.toFixed(2)} €\n`;
         txt += `  TCAM       : ${tc.toFixed(2)} €\n`;
         txt += `  Dons       : ${dn.toFixed(2)} €\n`;
         txt += `  Achats     : -${ac.toFixed(2)} €\n`;
         txt += `  Privat.    : ${pv.toFixed(2)} €\n`;
+        if (rc>0)  txt += `  RC         : ${rc.toFixed(2)} €\n`;
+        if (adh>0) txt += `  Adhésions  : ${adh.toFixed(2)} €\n`;
         txt += `  ► TOTAL    : ${tot.toFixed(2)} €\n`;
       });
-      const gTA  = sum(rows.filter(r=>r.Section==="CAISSETA"), "prix_total");
-      const gTC  = sum(rows.filter(r=>r.Section==="TCAM"),     "montant");
-      const gDN  = sum(rows.filter(r=>r.Section==="DONS"),     "montant");
-      const gAC  = sum(rows.filter(r=>r.Section==="ACHATS"),   "montant");
-      const gPV  = sum(rows.filter(r=>r.Section==="PRIVATISATION"), "montant_facture");
+      const gTA  = sum(rows.filter(r=>r.Section==="CAISSETA"));
+      const gTC  = sum(rows.filter(r=>r.Section==="TCAM"));
+      const gDN  = sum(rows.filter(r=>r.Section==="DONS"));
+      const gAC  = Math.abs(sum(rows.filter(r=>r.Section==="ACHATS")));
+      const gPV  = sum(rows.filter(r=>r.Section==="PRIVATISATION"));
+      const gRC  = sum(rows.filter(r=>r.Section==="RESTOCOLLECTIVE"));
+      const gADH = sum(rows.filter(r=>r.Section==="ADHESION"));
       txt += `\n${"─".repeat(40)}\nTOTAL TOUS CAFÉS\n${"─".repeat(40)}\n`;
       txt += `  TA         : ${gTA.toFixed(2)} €\n`;
       txt += `  TCAM       : ${gTC.toFixed(2)} €\n`;
       txt += `  Dons       : ${gDN.toFixed(2)} €\n`;
       txt += `  Achats     : -${gAC.toFixed(2)} €\n`;
       txt += `  Privat.    : ${gPV.toFixed(2)} €\n`;
-      txt += `  ► ENCAISSÉ : ${(gTA+gTC+gDN+gPV).toFixed(2)} €\n`;
+      if (gRC>0)  txt += `  RC         : ${gRC.toFixed(2)} €\n`;
+      if (gADH>0) txt += `  Adhésions  : ${gADH.toFixed(2)} €\n`;
+      txt += `  ► ENCAISSÉ : ${(gTA+gTC+gDN+gPV+gRC+gADH).toFixed(2)} €\n`;
       txt += `\nLe fichier CSV complet a été téléchargé automatiquement sur le poste de l'administrateur.`;
       return txt;
     };
@@ -390,7 +429,8 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       _memCache.set(key, data);
       // 2. localStorage comme backup hors-ligne
       try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(data)); } catch{}
-      // 3. Supabase : DELETE puis INSERT (évite les doublons sans contrainte UNIQUE)
+      // 3. Supabase : DELETE puis INSERT
+      window.dispatchEvent(new CustomEvent("daddy_save_start"));
       try {
         // Supprimer la ligne existante
         await supaFetch(
@@ -404,6 +444,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
           body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
         });
         if (res === null) throw new Error("INSERT failed");
+        window.dispatchEvent(new CustomEvent("daddy_save_done"));
         return true;
       } catch(e) {
         console.error("saveData error:", cafe, section, e.message);
@@ -498,7 +539,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
               mois: r.mois,
               produit: `Adhésion ${type}`,
               mode: m,
-              montant,
+              "montant TTC payé": montant,
             });
           });
         });
@@ -509,9 +550,9 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     const exportToXLSX = (cafe, period, periodType, allData) => {
       const fn = (row) => { if (!row.date) return false; if (periodType==="week") return row.semaine===period; if (periodType==="month") return row.mois===parseInt(period.replace("M","")); return true; };
       const rows = [];
-      ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(), TVA:"", ...r})));
-      explodeAdhesion((allData.adhesion||[]).filter(fn), cafe).forEach(r => rows.push({...r, TVA:""}));
-      (allData.restocollective||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:"RESTOCOLLECTIVE", TVA:r.tva_total?.toFixed(2)||"", ...r}));
+      ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(), ...normalizeRow(r,s)})));
+      explodeAdhesion((allData.adhesion||[]).filter(fn), cafe).forEach(r => rows.push({...r}));
+      (allData.restocollective||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:"RESTOCOLLECTIVE", ...normalizeRow(r,"restocollective")}));
       buildAndDownloadCSV(rows, `DaddyCafe_${cafe}_${period}_${new Date().toISOString().slice(0,10)}.csv`);
     };
 
@@ -558,8 +599,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">Build 17/04/2026 17:28</p>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.1 · Build du 15/04/2026 06:17</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.2 · Build du 28/04/2026 15:51</p>
             </div>
           </div>
         </div>
@@ -1134,8 +1174,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         setCarte(upd);
         await saveData(cafe,"carte",upd);
       };
-      const add=async()=>{ if(!f.label||!f.prix)return; const prod={id:`c_${Date.now()}`,label:f.label,prix:parseFloat(f.prix),type:f.type}; if(f.type==="Resto Coll.") prod.rcType=f.rcType||"Snacking"; await save([...carte,prod]); setF({label:"",prix:"",type:"Soft",rcType:"Snacking"}); };
-      const saveEdit=async(id)=>{ const upd={...carte.find(c=>c.id===id)||{},label:ef.label,prix:parseFloat(ef.prix),type:ef.type}; if(ef.type==="Resto Coll.") upd.rcType=ef.rcType||"Snacking"; else delete upd.rcType; await save(carte.map(c=>c.id===id?upd:c)); setEditId(null); };
+      const add=async()=>{ if(!f.label||!f.prix)return; const prod={id:`c_${Date.now()}`,label:f.label,prix:parseFloat(f.prix),type:f.type}; if(f.type==="Resto Coll.") prod.rcType=f.rcType||"10"; await save([...carte,prod]); setF({label:"",prix:"",type:"Soft",rcType:"10"}); };
+      const saveEdit=async(id)=>{ const upd={...carte.find(c=>c.id===id)||{},label:ef.label,prix:parseFloat(ef.prix),type:ef.type}; if(ef.type==="Resto Coll.") upd.rcType=ef.rcType||"10"; else delete upd.rcType; await save(carte.map(c=>c.id===id?upd:c)); setEditId(null); };
       const del=async(id)=>await save(carte.filter(c=>c.id!==id));
       const grouped=TYPES_PRODUIT.map(type=>({type,items:carte.filter(c=>c.type===type)}));
       const tBg={Soft:"bg-teal-50 border-teal-200",Alcool:"bg-amber-50 border-amber-200",Snacking:"bg-rose-50 border-rose-200","Resto Coll.":"bg-orange-50 border-orange-200"};
@@ -1149,7 +1189,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               <div><label className="text-xs text-gray-500 block mb-1">Nom</label><input type="text" placeholder="Ex: Kombucha…" value={f.label} onChange={e=>setF(x=>({...x,label:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300 w-52"/></div>
               <div><label className="text-xs text-gray-500 block mb-1">Prix (€)</label><input type="number" step="0.5" min="0" value={f.prix} onChange={e=>setF(x=>({...x,prix:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300 w-24"/></div>
               <div><label className="text-xs text-gray-500 block mb-1">Catégorie</label><select value={f.type} onChange={e=>setF(x=>({...x,type:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300">{TYPES_PRODUIT.map(t=><option key={t}>{t}</option>)}</select></div>
-              {f.type==="Resto Coll."&&<div><label className="text-xs text-gray-500 block mb-1">Type TVA</label><select value={f.rcType||"Snacking"} onChange={e=>setF(x=>({...x,rcType:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300"><option value="Snacking">Snacking (10%)</option><option value="Soft">Soft (20%)</option><option value="Alcool">Alcool (20%)</option></select></div>}
+              {f.type==="Resto Coll."&&<div><label className="text-xs text-gray-500 block mb-1">Type TVA</label><select value={f.rcType||"Snacking"} onChange={e=>setF(x=>({...x,rcType:e.target.value}))} className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300"><option value="0">0%</option><option value="5.5">5,5%</option><option value="10">10%</option><option value="20">20%</option></select></div>}
               <button onClick={add} className="bg-gray-800 hover:bg-gray-900 text-white px-5 py-2 rounded-xl text-sm font-medium transition-colors">+ Ajouter</button>
             </div>
           </div>
@@ -1163,12 +1203,12 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                     <><input value={ef.label} onChange={e=>setEf(x=>({...x,label:e.target.value}))} className={`border rounded-lg px-2 py-1 text-sm flex-1 focus:outline-none focus:ring-2 ${tRing[type]}`}/>
                     <input type="number" step="0.5" value={ef.prix} onChange={e=>setEf(x=>({...x,prix:e.target.value}))} className={`border rounded-lg px-2 py-1 text-sm w-20 focus:outline-none focus:ring-2 ${tRing[type]}`}/>
                     <select value={ef.type} onChange={e=>setEf(x=>({...x,type:e.target.value}))} className={`border rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 ${tRing[type]}`}>{TYPES_PRODUIT.map(t=><option key={t}>{t}</option>)}</select>
-                    {ef.type==="Resto Coll."&&<select value={ef.rcType||"Snacking"} onChange={e=>setEf(x=>({...x,rcType:e.target.value}))} className="border border-orange-200 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300"><option value="Snacking">10% Snacking</option><option value="Soft">20% Soft</option><option value="Alcool">20% Alcool</option></select>}
+                    {ef.type==="Resto Coll."&&<select value={ef.rcType||"Snacking"} onChange={e=>setEf(x=>({...x,rcType:e.target.value}))} className="border border-orange-200 rounded-lg px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-orange-300"><option value="0">0%</option><option value="5.5">5,5%</option><option value="10">10%</option><option value="20">20%</option></select>}
                     <button onClick={()=>saveEdit(item.id)} className="text-emerald-600 hover:text-emerald-700 text-xs font-semibold px-2">✓ Sauver</button>
                     <button onClick={()=>setEditId(null)} className="text-gray-400 hover:text-gray-600 text-xs px-2">Annuler</button></>
                   ):(
                     <><span className="flex-1 text-sm font-medium text-gray-800">{item.label}</span><span className="text-sm font-bold text-gray-700 w-14 text-right">{item.prix.toFixed(2)} €</span>
-                    {item.type==="Resto Coll."&&<span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">{TVA_RATES[item.rcType||"Snacking"]*100|0}% TVA</span>}
+                    {item.type==="Resto Coll."&&<span className="text-xs bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-medium">{RC_TVA_RATES[item.rcType] !== undefined ? RC_TVA_RATES[item.rcType]*100 : 10}% TVA</span>}
                     <button onClick={()=>{setEditId(item.id);setEf({label:item.label,prix:item.prix,type:item.type});}} className="text-xs text-gray-400 hover:text-gray-700 px-2 py-1 rounded-lg hover:bg-white transition-colors">✏️ Éditer</button>
                     <button onClick={()=>del(item.id)} className="text-xs text-rose-400 hover:text-rose-600 px-2 py-1 rounded-lg hover:bg-white transition-colors">✕</button></>
                   )}
@@ -1182,42 +1222,64 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     };
 
     /* ── DASHBOARD GLOBAL ── */
+
+    /* ── ERROR BOUNDARY ── */
+    class ErrorBoundary extends React.Component {
+      constructor(props) { super(props); this.state = { error: null }; }
+      static getDerivedStateFromError(err) { return { error: err }; }
+      componentDidCatch(err, info) { console.error("DaddyPay crash:", err, info); }
+      render() {
+        if (this.state.error) {
+          return <div className="p-8 text-center">
+            <div className="text-4xl mb-4">⚠️</div>
+            <p className="text-red-600 font-semibold mb-2">Erreur d'affichage</p>
+            <p className="text-gray-500 text-sm mb-4">{this.state.error.message}</p>
+            <button onClick={()=>this.setState({error:null})} className="bg-red-600 text-white px-4 py-2 rounded-xl text-sm">Réessayer</button>
+          </div>;
+        }
+        return this.props.children;
+      }
+    }
+
     const DashboardGlobal = ({ cafes, onCafeCreated, isAdmin, supaStatus=null, initialSubTab="dashboard", onSubTabChange=()=>{}, allCafesData={}, allCafesLoading=false, onForceRefresh=()=>{} }) => {
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
       const [subTab,setSubTab]=useState(initialSubTab);
       useEffect(()=>{ if(initialSubTab!==subTab) setSubTab(initialSubTab); },[initialSubTab]);
 
-      const loading = allCafesLoading;
       const forceRefresh = onForceRefresh;
 
-      const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
-      const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
-
+      // Fonctions utilitaires — définies EN PREMIER
+      const n = v => (typeof v==="number" && isFinite(v)) ? v : 0;
       const safeArr = a => Array.isArray(a) ? a : [];
-      const stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=fil(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=sum(fTA),tc=sum(fTC,"montant"),dn=sum(fD,"montant"),ac=sum(fA,"montant"),pv=sum(fP,"montant_facture"),adh=sum(fADH,"total"),rc=sum(fRC,"prix_total"); return{cafe,ta:n(ta),tc:n(tc),dn:n(dn),ac:n(ac),pv:n(pv),adh:n(adh),rc:n(rc),total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH}; });
-      const n = v => (typeof v==='number' && isFinite(v)) ? v : 0;
-      const GT=stats.reduce((s,c)=>({ta:s.ta+n(c.ta),tc:s.tc+n(c.tc),dn:s.dn+n(c.dn),ac:s.ac+n(c.ac),pv:s.pv+n(c.pv),adh:s.adh+n(c.adh),rc:s.rc+n(c.rc),total:s.total+n(c.total)}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0});
+      const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
+      const sum=(arr,k="prix_total")=>{ const r=safeArr(arr).reduce((s,r)=>s+(parseFloat(r[k])||0),0); return isFinite(r)?r:0; };
 
-      const weekly=WEEKS_2026.slice(0,20).map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); }); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh}; }).filter(r=>r.ta+r.tc+r.dn+r.ac+r.adh>0);
-
-      const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ if(!r.date)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),TVA:"",...r}))); explodeAdhesion((d.adhesion||[]).filter(fn),c).forEach(r=>rows.push({...r,TVA:""})); (d.restocollective||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:"RESTOCOLLECTIVE",TVA:r.tva_total?.toFixed(2)||"",...r})); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
-
-
-
-      // Ne pas render le dashboard tant que les données ne sont pas chargées
-      if (allCafesLoading && Object.keys(allCafesData).length === 0) {
+      // Guard : afficher spinner si données pas encore chargées — AVANT tout calcul
+      if (Object.keys(allCafesData).length === 0) {
         return <div className="p-12 text-center">
           <div className="text-4xl mb-4">⏳</div>
-          <p className="text-gray-500 font-medium">Chargement des données de tous les cafés…</p>
+          <p className="text-gray-500 font-medium">Chargement des données…</p>
+          <p className="text-sm text-gray-400 mt-2">Cliquez sur 🔄 si le chargement ne démarre pas.</p>
         </div>;
       }
 
-      if (allCafesLoading && Object.keys(allCafesData).length===0) {
-        return <div className="p-12 text-center text-gray-400">
-          <div className="text-3xl mb-3">⏳</div>
-          <p>Chargement des données…</p>
-        </div>;
-      }
+      let stats = [], GT = {ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0};
+      try {
+        stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=fil(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=n(sum(fTA)),tc=n(sum(fTC,"montant")),dn=n(sum(fD,"montant")),ac=n(sum(fA,"montant")),pv=n(sum(fP,"montant_facture")),adh=n(sum(fADH,"total")),rc=n(sum(fRC,"prix_total")); return{cafe,ta,tc,dn,ac,pv,adh,rc,total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH}; });
+        GT=stats.reduce((s,c)=>({ta:s.ta+n(c.ta),tc:s.tc+n(c.tc),dn:s.dn+n(c.dn),ac:s.ac+n(c.ac),pv:s.pv+n(c.pv),adh:s.adh+n(c.adh),rc:s.rc+n(c.rc),total:s.total+n(c.total)}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0});
+      } catch(statsErr) { console.error("STATS CRASH:", statsErr.message, statsErr.stack); }
+
+      let weekly = [];
+      try {
+        weekly=WEEKS_2026.slice(0,20).map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); }); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh}; }).filter(r=>r.ta+r.tc+r.dn+r.ac+r.adh>0);
+      } catch(wErr) { console.error("WEEKLY CRASH:", wErr.message); }
+
+      const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ if(!r.date)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),...normalizeRow(r,s)}))); explodeAdhesion((d.adhesion||[]).filter(fn),c).forEach(r=>rows.push({...r})); (d.restocollective||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:"RESTOCOLLECTIVE",...normalizeRow(r,"restocollective")})); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
+
+
+
+      // Afficher spinner uniquement si chargement EN COURS et aucune donnée encore
+
 
       return (
         <div className="space-y-6">
@@ -1240,14 +1302,14 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             </div>
             {/* KPIs */}
             <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-              <StatCard label="Total TA — tous cafés" value={`${GT.ta.toFixed(2)} €`} color="emerald"/>
-              <StatCard label="Total TCAM — tous cafés" value={`${GT.tc.toFixed(2)} €`} color="amber"/>
-              <StatCard label="Total Dons — tous cafés" value={`${GT.dn.toFixed(2)} €`} color="rose"/>
-              <StatCard label="Total Achats — tous cafés" value={`${GT.ac.toFixed(2)} €`} color="sky"/>
-              <StatCard label="Privatisations" value={`${GT.pv.toFixed(2)} €`} color="violet"/>
-              <StatCard label="Adhésions — tous cafés" value={`${GT.adh.toFixed(2)} €`} color="violet"/>
-              {GT.rc>0&&<StatCard label="Resto Collective — tous cafés" value={`${GT.rc.toFixed(2)} €`} color="amber" sub="TTC (tous cafés RC)"/>}
-              <StatCard label="GRAND TOTAL encaissé" value={`${GT.total.toFixed(2)} €`} color="emerald" sub="TA + TCAM + Dons + Privat. + Adh. + RC"/>
+              <StatCard label="Total TA — tous cafés" value={`${(GT.ta||0).toFixed(2)} €`} color="emerald"/>
+              <StatCard label="Total TCAM — tous cafés" value={`${(GT.tc||0).toFixed(2)} €`} color="amber"/>
+              <StatCard label="Total Dons — tous cafés" value={`${(GT.dn||0).toFixed(2)} €`} color="rose"/>
+              <StatCard label="Total Achats — tous cafés" value={`${(GT.ac||0).toFixed(2)} €`} color="sky"/>
+              <StatCard label="Privatisations" value={`${(GT.pv||0).toFixed(2)} €`} color="violet"/>
+              <StatCard label="Adhésions — tous cafés" value={`${(GT.adh||0).toFixed(2)} €`} color="violet"/>
+              {GT.rc>0&&<StatCard label="Resto Collective — tous cafés" value={`${(GT.rc||0).toFixed(2)} €`} color="amber" sub="TTC (tous cafés RC)"/>}
+              <StatCard label="GRAND TOTAL encaissé" value={`${(GT.total||0).toFixed(2)} €`} color="emerald" sub="TA + TCAM + Dons + Privat. + Adh. + RC"/>
             </div>
             {/* Tableau par café */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
@@ -1255,22 +1317,22 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               <div className="overflow-x-auto"><table className="w-full text-sm">
                 <thead><tr className="bg-gray-50 border-b border-gray-100">{["Café","TA","TCAM","Dons","Achats","Privatisations","Adhésions","Restau","Total encaissé"].map(h=><th key={h} className="text-left px-4 py-2.5 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>)}</tr></thead>
                 <tbody>
-                  {stats.map(({cafe,ta,tc,dn,ac,pv,adh,total},i)=>(
+                  {stats.map(({cafe,ta,tc,dn,ac,pv,adh,rc,total},i)=>(
                     <tr key={cafe} className="border-t border-gray-50 hover:bg-gray-50 transition-colors">
                       <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{backgroundColor:CAFE_COLORS_LIST[i%CAFE_COLORS_LIST.length]}}></span><span className="font-medium text-gray-800">{cafe}</span></div></td>
-                      <td className="px-4 py-3 text-emerald-600 font-medium">{ta.toFixed(2)} €</td>
-                      <td className="px-4 py-3 text-amber-600 font-medium">{tc.toFixed(2)} €</td>
-                      <td className="px-4 py-3 text-rose-600 font-medium">{dn.toFixed(2)} €</td>
-                      <td className="px-4 py-3 text-sky-600 font-medium">−{ac.toFixed(2)} €</td>
-                      <td className="px-4 py-3 text-violet-600 font-medium">{pv.toFixed(2)} €</td>
-                      <td className="px-4 py-3 text-indigo-600 font-medium">{adh.toFixed(2)} €</td>
-                      <td className="px-4 py-3 text-orange-600 font-medium">{rc>0?`${rc.toFixed(2)} €`:"—"}</td>
-                      <td className="px-4 py-3 font-bold text-gray-800">{total.toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-emerald-600 font-medium">{(ta||0).toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-amber-600 font-medium">{(tc||0).toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-rose-600 font-medium">{(dn||0).toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-sky-600 font-medium">−{(ac||0).toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-violet-600 font-medium">{(pv||0).toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-indigo-600 font-medium">{(adh||0).toFixed(2)} €</td>
+                      <td className="px-4 py-3 text-orange-600 font-medium">{rc>0?`${(rc||0).toFixed(2)} €`:"—"}</td>
+                      <td className="px-4 py-3 font-bold text-gray-800">{(total||0).toFixed(2)} €</td>
                     </tr>
                   ))}
                   <tr className="border-t-2 border-gray-200 bg-gray-50 font-bold text-sm">
                     <td className="px-4 py-3 text-gray-700">TOTAL</td>
-                    <td className="px-4 py-3 text-emerald-700">{GT.ta.toFixed(2)} €</td><td className="px-4 py-3 text-amber-700">{GT.tc.toFixed(2)} €</td><td className="px-4 py-3 text-rose-700">{GT.dn.toFixed(2)} €</td><td className="px-4 py-3 text-sky-700">−{GT.ac.toFixed(2)} €</td><td className="px-4 py-3 text-violet-700">{GT.pv.toFixed(2)} €</td><td className="px-4 py-3 text-indigo-700">{GT.adh.toFixed(2)} €</td><td className="px-4 py-3 text-orange-700">{GT.rc>0?`${GT.rc.toFixed(2)} €`:"—"}</td><td className="px-4 py-3 text-gray-900">{GT.total.toFixed(2)} €</td>
+                    <td className="px-4 py-3 text-emerald-700">{(GT.ta||0).toFixed(2)} €</td><td className="px-4 py-3 text-amber-700">{(GT.tc||0).toFixed(2)} €</td><td className="px-4 py-3 text-rose-700">{(GT.dn||0).toFixed(2)} €</td><td className="px-4 py-3 text-sky-700">−{(GT.ac||0).toFixed(2)} €</td><td className="px-4 py-3 text-violet-700">{(GT.pv||0).toFixed(2)} €</td><td className="px-4 py-3 text-indigo-700">{(GT.adh||0).toFixed(2)} €</td><td className="px-4 py-3 text-orange-700">{GT.rc>0?`${(GT.rc||0).toFixed(2)} €`:"—"}</td><td className="px-4 py-3 text-gray-900">{(GT.total||0).toFixed(2)} €</td>
                   </tr>
                 </tbody>
               </table></div>
@@ -1281,20 +1343,20 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 <h4 className="text-sm font-semibold text-gray-700 mb-1">Modes de paiement</h4>
                 <p className="text-xs text-gray-400 mb-3">TA + TCAM + Dons + Adhésions — tous cafés</p>
                 {[...MODES,"Prélèvement"].map(m=>{
-                  const vTA  = stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.mode===m)),0);
-                  const vTC  = stats.reduce((s,c)=>s+sum(c.fTC.filter(r=>r.mode===m),"montant"),0);
-                  const vD   = stats.reduce((s,c)=>s+sum(c.fD.filter(r=>r.mode===m),"montant"),0);
+                  const vTA  = stats.reduce((s,c)=>s+sum((c.fTA||[]).filter(r=>r.mode===m)),0);
+                  const vTC  = stats.reduce((s,c)=>s+sum((c.fTC||[]).filter(r=>r.mode===m),"montant"),0);
+                  const vD   = stats.reduce((s,c)=>s+sum((c.fD||[]).filter(r=>r.mode===m),"montant"),0);
                   const vADH = stats.reduce((s,c)=>s+c.fADH.reduce((a,r)=>a+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0),0);
                   const v    = vTA+vTC+vD+vADH;
                   if(v===0) return null;
                   return <div key={m} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0">
                     <span className="text-sm text-gray-600">{m}</span>
-                    <span className="font-semibold text-gray-800">{v.toFixed(2)} €</span>
+                    <span className="font-semibold text-gray-800">{(v||0).toFixed(2)} €</span>
                   </div>;
                 })}
-                {[...MODES,"Prélèvement"].every(m=>{ const vTA=stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.mode===m)),0); const vTC=stats.reduce((s,c)=>s+sum(c.fTC.filter(r=>r.mode===m),"montant"),0); const vD=stats.reduce((s,c)=>s+sum(c.fD.filter(r=>r.mode===m),"montant"),0); const vADH=stats.reduce((s,c)=>s+c.fADH.reduce((a,r)=>a+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0),0); return vTA+vTC+vD+vADH===0; })&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}
+                {[...MODES,"Prélèvement"].every(m=>{ const vTA=stats.reduce((s,c)=>s+sum((c.fTA||[]).filter(r=>r.mode===m)),0); const vTC=stats.reduce((s,c)=>s+sum((c.fTC||[]).filter(r=>r.mode===m),"montant"),0); const vD=stats.reduce((s,c)=>s+sum((c.fD||[]).filter(r=>r.mode===m),"montant"),0); const vADH=stats.reduce((s,c)=>s+c.fADH.reduce((a,r)=>a+(parseFloat(r[`indiv_${m}`])||0)+(parseFloat(r[`struc_${m}`])||0),0),0); return vTA+vTC+vD+vADH===0; })&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}
               </div>
-              <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">TA global — Répartition par type</h4>{["Soft","Alcool","Snacking"].map(t=>{const v=stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.typo===t)),0);if(v===0)return null;return<div key={t} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0"><span className="text-sm text-gray-600">{t}</span><span className="font-semibold text-emerald-600">{v.toFixed(2)} €</span></div>;})} {["Soft","Alcool","Snacking"].every(t=>stats.reduce((s,c)=>s+sum(c.fTA.filter(r=>r.typo===t)),0)===0)&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}</div>
+              <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">TA global — Répartition par type</h4>{["Soft","Alcool","Snacking"].map(t=>{const v=stats.reduce((s,c)=>s+sum((c.fTA||[]).filter(r=>r.typo===t)),0);if(v===0)return null;return<div key={t} className="flex justify-between items-center py-1.5 border-b border-gray-50 last:border-0"><span className="text-sm text-gray-600">{t}</span><span className="font-semibold text-emerald-600">{(v||0).toFixed(2)} €</span></div>;})} {["Soft","Alcool","Snacking"].every(t=>stats.reduce((s,c)=>s+sum((c.fTA||[]).filter(r=>r.typo===t)),0)===0)&&<p className="text-sm text-gray-400 text-center py-4">Aucune donnée</p>}</div>
             </div>
             {/* Récap hebdo */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">Récap. hebdomadaire — tous cafés</h4>
@@ -1313,7 +1375,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   </tr></thead>
                   <tbody>
                     {(()=>{
-                      const sumM=(arr,key)=>MONTHS.map((_,i)=>arr.filter(r=>r.mois===i+1).reduce((s,r)=>s+(parseFloat(r[key])||0),0));
+                      const sumM=(arr,key)=>MONTHS.map((_,i)=>{ const v=safeArr(arr).filter(r=>r.mois===i+1).reduce((s,r)=>s+(parseFloat(r[key])||0),0); return isFinite(v)?v:0; });
                       const addM=(a,b)=>a.map((v,i)=>v+b[i]);
                       let recM=MONTHS.map(()=>0), acM=MONTHS.map(()=>0);
                       cafes.forEach(c=>{
@@ -1323,7 +1385,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                       });
                       const margeM=recM.map((v,i)=>v-acM[i]);
                       const totRec=recM.reduce((a,b)=>a+b,0), totAc=acM.reduce((a,b)=>a+b,0), totMarge=totRec-totAc;
-                      const fmt=v=>v===0?"—":`${v.toFixed(0)}€`;
+                      const fmt=v=>v===0?"—":`${(v||0).toFixed(0)}€`;
                       const fmtPct=(m,r)=>r===0?"—":`${((m/r)*100).toFixed(0)}%`;
                       return <>
                         <tr className="border-t border-gray-50 hover:bg-gray-50">
@@ -1452,7 +1514,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                     <td className="px-3 py-2 font-bold text-gray-800">TOTAL</td>
                     {MODES_ADH.map(m=>{
                       const v=(parseFloat(form[`indiv_${m}`])||0)+(parseFloat(form[`struc_${m}`])||0);
-                      return <td key={m} className="px-2 py-2 text-center font-semibold text-gray-700">{v>0?`${v.toFixed(2)}€`:"—"}</td>;
+                      return <td key={m} className="px-2 py-2 text-center font-semibold text-gray-700">{v>0?`${(v||0).toFixed(2)}€`:"—"}</td>;
                     })}
                     <td className="px-3 py-2 text-right font-bold text-indigo-800">{(totalIndiv+totalStruc).toFixed(2)} €</td>
                   </tr>
@@ -1553,7 +1615,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <div className="mb-4">
               <div className="flex items-center justify-between mb-2">
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">🪙 Pièces (0.10€ → 2€)</p>
-                <span className="text-sm font-bold text-amber-700 bg-amber-50 px-3 py-1 rounded-lg">Sous-total : {totalPieces.toFixed(2)} €</span>
+                <span className="text-sm font-bold text-amber-700 bg-amber-50 px-3 py-1 rounded-lg">Sous-total : {(totalPieces||0).toFixed(2)} €</span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
                 {PIECES.filter(p=>p.type==="piece").map(p=>(
@@ -1571,7 +1633,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <div className="mb-3">
               <div className="flex items-center justify-between mb-2">
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">💵 Billets (5€ → 200€)</p>
-                <span className="text-sm font-bold text-emerald-700 bg-emerald-50 px-3 py-1 rounded-lg">Sous-total : {totalBillets.toFixed(2)} €</span>
+                <span className="text-sm font-bold text-emerald-700 bg-emerald-50 px-3 py-1 rounded-lg">Sous-total : {(totalBillets||0).toFixed(2)} €</span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
                 {PIECES.filter(p=>p.type==="billet").map(p=>(
@@ -1593,7 +1655,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <div className="grid grid-cols-3 gap-4">
               <div className="text-center p-4 bg-amber-50 rounded-2xl">
                 <p className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Total en caisse</p>
-                <p className="text-2xl font-bold text-amber-700">{totalMonnaie.toFixed(2)} €</p>
+                <p className="text-2xl font-bold text-amber-700">{(totalMonnaie||0).toFixed(2)} €</p>
               </div>
               <div className="text-center p-4 bg-emerald-50 rounded-2xl">
                 <p className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Encaissé Espèces</p>
@@ -1601,7 +1663,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </div>
               <div className={`text-center p-4 rounded-2xl ${Math.abs(ecart)<0.01?"bg-gray-50":ecart>0?"bg-emerald-50":"bg-rose-50"}`}>
                 <p className="text-xs text-gray-500 mb-1 uppercase tracking-wide">Écart</p>
-                <p className={`text-2xl font-bold ${Math.abs(ecart)<0.01?"text-gray-600":ecart>0?"text-emerald-700":"text-rose-700"}`}>{ecart>=0?"+":""}{ecart.toFixed(2)} €</p>
+                <p className={`text-2xl font-bold ${Math.abs(ecart)<0.01?"text-gray-600":ecart>0?"text-emerald-700":"text-rose-700"}`}>{ecart>=0?"+":""}{(ecart||0).toFixed(2)} €</p>
               </div>
             </div>
           </div>
@@ -1622,9 +1684,11 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       useEffect(()=>{ loadData(cafe,"restocollective").then(d=>{ setRows(d); setLoading(false); }); },[cafe,refreshTick]);
 
       const calcTVA = (item) => {
-        // Pour les produits Resto Coll., utiliser rcType pour la TVA
-        const tvaKey = item.rcType || (item.type==="Snacking"?"Snacking":item.type);
-        const rate = TVA_RATES[tvaKey] || 0.20;
+        // Taux TVA RC : rcType est directement le taux ("0","5.5","10","20")
+        // Pour les autres types (Soft, Alcool, Snacking), utiliser TVA_RATES
+        const rate = RC_TVA_RATES[item.rcType] !== undefined
+          ? RC_TVA_RATES[item.rcType]
+          : (TVA_RATES[item.type] || 0.20);
         const ttc  = item.prix;
         const ht   = parseFloat((ttc / (1+rate)).toFixed(4));
         const tva  = parseFloat((ttc - ht).toFixed(4));
@@ -1689,7 +1753,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <span className="text-orange-500 text-lg mt-0.5">ℹ️</span>
             <div className="text-xs text-orange-800">
               <strong>TVA appliquée automatiquement</strong> — Prix saisis TTC :<br/>
-              🍽️ Snacking : TVA 10% | 🍴 Restauration Coll. : TVA selon type | 🥤 Softs : TVA 20% | 🍺 Alcools : TVA 20%
+              🍴 Restauration Collective : TVA 0% / 5,5% / 10% / 20% selon produit | 🥤 Softs : 20% | 🍺 Alcools : 20% | 🍽️ Snacking : 10%
             </div>
           </div>
 
@@ -1707,7 +1771,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   </div>
                 </div>
               ))}
-              <div className="mt-2"><select value={selProd} onChange={e=>add(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-2 text-sm w-full focus:outline-none focus:ring-2 focus:ring-orange-300"><option value="">+ Ajouter via la liste complète…</option>{carte.map(c=><option key={c.id} value={c.label}>{c.label} ({c.prix}€ TTC — TVA {(TVA_RATES[c.rcType||c.type]||0.20)*100}%)</option>)}</select></div>
+              <div className="mt-2"><select value={selProd} onChange={e=>add(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-2 text-sm w-full focus:outline-none focus:ring-2 focus:ring-orange-300"><option value="">+ Ajouter via la liste complète…</option>{carte.map(c=><option key={c.id} value={c.label}>{c.label} ({c.prix}€ TTC — TVA {RC_TVA_RATES[c.rcType]!==undefined?RC_TVA_RATES[c.rcType]*100:(TVA_RATES[c.type]||0.20)*100}%)</option>)}</select></div>
             </div>
 
             {/* Panier */}
@@ -1728,9 +1792,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   </div>
                 ))}
                 <div className="px-4 py-2 bg-orange-50 border-t border-orange-100 text-xs text-gray-600 flex gap-4">
-                  <span>HT : <strong>{totalHT.toFixed(2)} €</strong></span>
-                  <span>TVA : <strong>{totalTVA.toFixed(2)} €</strong></span>
-                  <span className="font-bold text-orange-700">TTC : {totalTTC.toFixed(2)} €</span>
+                  <span>HT : <strong>{(totalHT||0).toFixed(2)} €</strong></span>
+                  <span>TVA : <strong>{(totalTVA||0).toFixed(2)} €</strong></span>
+                  <span className="font-bold text-orange-700">TTC : {(totalTTC||0).toFixed(2)} €</span>
                 </div>
               </div>
             )}
@@ -1739,8 +1803,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               <div>{panier.length>0
                 ? <div className="bg-orange-500 text-white rounded-xl px-5 py-3 shadow-sm text-center">
                     <p className="text-xs opacity-80 uppercase tracking-wide">À encaisser TTC</p>
-                    <p className="text-3xl font-bold">{totalTTC.toFixed(2)} €</p>
-                    <p className="text-xs opacity-70">dont TVA {totalTVA.toFixed(2)} €</p>
+                    <p className="text-3xl font-bold">{(totalTTC||0).toFixed(2)} €</p>
+                    <p className="text-xs opacity-70">dont TVA {(totalTVA||0).toFixed(2)} €</p>
                   </div>
                 : <span className="text-sm text-gray-400">Ajoutez des produits ci-dessus</span>
               }</div>
@@ -1805,6 +1869,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       });
       const [rcEnabled,setRcEnabled] = useState({});
       const [saveError,setSaveError] = useState(null);
+      const [saving,setSaving] = useState(false);
       const [supaStatus,setSupaStatus] = useState(null);
       const [subTabAdmin,setSubTabAdmin] = useState("dashboard");
       const [allCafesData,setAllCafesData] = useState({});
@@ -1836,14 +1901,23 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         return () => window.removeEventListener("rc_updated", h);
       }, []);
 
-      // Save error notification
+      // Indicateur de sauvegarde
       useEffect(()=>{
-        const h = (e) => {
-          setSaveError("\u274C Erreur sauvegarde (" + (e.detail?.section||"?") + ") \u2014 v\u00e9rifiez votre connexion internet.");
-          setTimeout(()=>setSaveError(null), 7000);
+        const onStart = () => { setSaving(true); };
+        const onDone  = () => { setSaving(false); };
+        const onError = (e) => {
+          setSaving(false);
+          setSaveError("💾 Sauvegarde en cours…");
+          setTimeout(()=>setSaveError(null), 5000);
         };
-        window.addEventListener("daddy_save_error", h);
-        return () => window.removeEventListener("daddy_save_error", h);
+        window.addEventListener("daddy_save_start", onStart);
+        window.addEventListener("daddy_save_done",  onDone);
+        window.addEventListener("daddy_save_error", onError);
+        return () => {
+          window.removeEventListener("daddy_save_start", onStart);
+          window.removeEventListener("daddy_save_done",  onDone);
+          window.removeEventListener("daddy_save_error", onError);
+        };
       }, []);
 
       // Auto-reports
@@ -1868,6 +1942,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const loadAllCafes = async (force=false) => {
         if (_loadingRef.current) return;
         if (allCafesLoaded && !force) return;
+        if (!cafes || cafes.length === 0) return; // rien à charger
         _loadingRef.current = true;
         setAllCafesLoading(true);
         if (force) setAllCafesLoaded(false);
@@ -1889,9 +1964,21 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         }
       };
 
+      // Déclencher le chargement dès que globalView=true ET cafes disponibles
       useEffect(()=>{
-        if (globalView && !allCafesLoaded && !_loadingRef.current) loadAllCafes();
-      }, [globalView, allCafesLoaded]);
+        if (!globalView) return;
+        if (allCafesLoaded) return;
+        if (_loadingRef.current) return;
+        if (cafes.length === 0) return; // cafes pas encore chargés, l'effect se relancera
+        loadAllCafes();
+      }, [globalView, allCafesLoaded, cafes.length]);
+
+      // Si globalView=true mais cafes encore vide, réessayer dès que cafes arrive
+      useEffect(()=>{
+        if (globalView && cafes.length > 0 && !allCafesLoaded && !_loadingRef.current) {
+          loadAllCafes();
+        }
+      }, [cafes]);
 
       // Login screen
       if (!session) {
@@ -1901,6 +1988,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             setSelCafe(cafes[0]||null);
             setSubTabAdmin("dashboard");
             setGlobalView(true);
+            // Déclencher le chargement immédiatement (sans attendre le prochain tick)
+            requestAnimationFrame(() => {
+              if (!_loadingRef.current) loadAllCafes();
+            });
           } else {
             setSelCafe(s.cafe);
             setGlobalView(false);
@@ -1959,7 +2050,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   {/* Statut Supabase */}
                   <span title={supaStatus===null?"Test connexion…":supaStatus?"Base de données connectée — données partagées entre tous les utilisateurs":"⚠️ Base de données inaccessible — données sauvegardées localement uniquement"}
                     className={`hidden sm:flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-medium border ${supaStatus===null?"bg-white/10 border-white/20 opacity-60":supaStatus?"bg-emerald-500/20 border-emerald-300/40":"bg-rose-500/30 border-rose-300/40"}`}>
-                    <span>{supaStatus===null?"⏳":supaStatus?"🟢":"🔴"}</span>
+                    <span>{saving?"💾":supaStatus===null?"⏳":supaStatus?"🟢":"🔴"}</span>
                     <span className="hidden md:inline">{supaStatus===null?"…":supaStatus?"DB":"Hors ligne"}</span>
                   </span>
                   {/* Déconnexion */}
@@ -1993,7 +2084,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             {globalView?(
               <>
                 <div className="mb-4 flex items-center gap-2"><span className="inline-block w-3 h-3 rounded-full" style={{backgroundColor:ADMIN_COLOR}}></span><h2 className="text-sm font-semibold text-gray-600">Vue globale — Tous les cafés</h2></div>
-                <DashboardGlobal cafes={cafes} onCafeCreated={setCafes} isAdmin={isAdmin} supaStatus={supaStatus} initialSubTab={subTabAdmin} onSubTabChange={setSubTabAdmin} allCafesData={allCafesData} allCafesLoading={allCafesLoading} onForceRefresh={()=>loadAllCafes(true)}/>
+                <ErrorBoundary><DashboardGlobal cafes={cafes} onCafeCreated={setCafes} isAdmin={isAdmin} supaStatus={supaStatus} initialSubTab={subTabAdmin} onSubTabChange={setSubTabAdmin} allCafesData={allCafesData} allCafesLoading={allCafesLoading} onForceRefresh={()=>loadAllCafes(true)}/></ErrorBoundary>
               </>
             ):(
               <>
@@ -2018,6 +2109,21 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       );
     }
 
+    // Capturer toutes les erreurs JS non catchées
+    window.onerror = function(msg, src, line, col, err) {
+      document.body.innerHTML = '<div style="padding:40px;font-family:monospace;background:#fff;">' +
+        '<h2 style="color:#B7242B">❌ Erreur JavaScript DaddyPay</h2>' +
+        '<p style="color:#333;margin:10px 0"><b>Message:</b> ' + msg + '</p>' +
+        '<p style="color:#666;margin:5px 0"><b>Ligne:</b> ' + line + ', Col: ' + col + '</p>' +
+        '<p style="color:#666;margin:5px 0"><b>Fichier:</b> ' + src + '</p>' +
+        (err ? '<p style="color:#666;margin:5px 0"><b>Stack:</b><br><pre>' + err.stack + '</pre></p>' : '') +
+        '<button onclick="location.reload()" style="margin-top:20px;padding:10px 20px;background:#B7242B;color:white;border:none;border-radius:8px;cursor:pointer">Recharger</button>' +
+        '</div>';
+      return true;
+    };
+    window.onunhandledrejection = function(e) {
+      window.onerror(e.reason?.message || String(e.reason), '', 0, 0, e.reason);
+    };
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(<App />);
   </script>
