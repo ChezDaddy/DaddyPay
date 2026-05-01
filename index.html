@@ -508,7 +508,24 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       { id:"madeleine",label:"Madeleine",         prix:0.5, type:"Snacking" },
     ];
     const MODES = ["CB","Espèces","Chèque","Virement"];
-    const DESTINATIONS_ACHATS = ["TCAM+TA","Petits investissements","Evénementiel"];
+    const DEST_KEY = "daddy_destinations_achats";
+    const DEST_DEFAULT = ["TCAM+TA","Petits investissements","Evénementiel"];
+    // Structure : { "Caluire": ["dest1","dest2"], "_default": [...] }
+    // "_default" = liste commune si aucune liste spécifique au café
+    const loadAllDestinations = () => { try { const r=localStorage.getItem(DEST_KEY); return r?JSON.parse(r):{}; } catch { return {}; } };
+    const saveAllDestinations = (obj) => { try { localStorage.setItem(DEST_KEY,JSON.stringify(obj)); } catch {} };
+    const loadDestinations = (cafe) => {
+      const all = loadAllDestinations();
+      if (cafe && all[cafe] !== undefined) return all[cafe];
+      if (all["_default"] !== undefined) return all["_default"];
+      return DEST_DEFAULT;
+    };
+    const saveDestinations = (cafe, d) => {
+      const all = loadAllDestinations();
+      all[cafe] = d;
+      saveAllDestinations(all);
+    };
+    const DESTINATIONS_ACHATS = loadDestinations(null);
 
     /* ── CSV EXPORT ── */
     const buildAndDownloadCSV = (rows, filename) => {
@@ -599,7 +616,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.2 · Build du 28/04/2026 15:51</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.2 · Build du 01/05/2026 13:12</p>
             </div>
           </div>
         </div>
@@ -635,6 +652,20 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       const [msgType,setMsgType] = useState("ok"); // "ok" | "err"
       const [sending,setSending] = useState("");
       const [purgeConfirm,setPurgeConfirm] = useState(false);
+      const [allDest,setAllDest] = useState(()=>loadAllDestinations());
+      const [destCafe,setDestCafe] = useState("_default");
+      const [newDest,setNewDest] = useState("");
+      const getDestForCafe = (c) => {
+        if (allDest[c] !== undefined) return allDest[c];
+        if (c !== "_default" && allDest["_default"] !== undefined) return [...allDest["_default"]];
+        return [...DEST_DEFAULT];
+      };
+      const saveDest = (c, d) => {
+        const upd = {...allDest, [c]: d};
+        setAllDest(upd);
+        saveAllDestinations(upd);
+        window.dispatchEvent(new CustomEvent("destinations_updated"));
+      };
       const [purgeResult,setPurgeResult]   = useState(null);
 
       const flash = (m,t="ok") => { setMsg(m); setMsgType(t); setTimeout(()=>setMsg(""),4000); };
@@ -810,6 +841,42 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             </div>
           </div>
 
+          {/* Destinations achats */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-3">🏷️ Destinations d'achat</h3>
+            <div className="flex items-center gap-3 mb-4">
+              <label className="text-sm text-gray-600 font-medium whitespace-nowrap">Configurer pour :</label>
+              <select value={destCafe} onChange={e=>{setDestCafe(e.target.value);setNewDest("");}}
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300">
+                <option value="_default">🌐 Liste commune (tous cafés)</option>
+                {cafes.map(c=><option key={c} value={c}>☕ {c}{allDest[c]?"":" (utilise liste commune)"}</option>)}
+              </select>
+              {destCafe!=="default"&&allDest[destCafe]&&<button onClick={()=>{
+                const upd={...allDest}; delete upd[destCafe]; setAllDest(upd); saveAllDestinations(upd);
+                window.dispatchEvent(new CustomEvent("destinations_updated"));
+              }} className="text-xs text-gray-400 hover:text-rose-500 underline">Réinitialiser (utiliser liste commune)</button>}
+            </div>
+            <div className="flex flex-wrap gap-2 mb-3">
+              {getDestForCafe(destCafe).map((d,i)=>(
+                <span key={i} className="flex items-center gap-1 bg-sky-50 border border-sky-200 text-sky-800 text-xs font-medium px-3 py-1.5 rounded-full">
+                  {d}
+                  <button onClick={()=>saveDest(destCafe, getDestForCafe(destCafe).filter((_,j)=>j!==i))}
+                    className="ml-1 text-sky-400 hover:text-rose-500 font-bold leading-none">×</button>
+                </span>
+              ))}
+              {getDestForCafe(destCafe).length===0&&<p className="text-sm text-gray-400 italic">Aucune destination</p>}
+            </div>
+            <div className="flex gap-2">
+              <input value={newDest} onChange={e=>setNewDest(e.target.value)}
+                onKeyDown={e=>{ if(e.key==="Enter"&&newDest.trim()){ saveDest(destCafe,[...getDestForCafe(destCafe),newDest.trim()]); setNewDest(""); }}}
+                placeholder="Nouvelle destination…"
+                className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+              <button onClick={()=>{ if(!newDest.trim())return; saveDest(destCafe,[...getDestForCafe(destCafe),newDest.trim()]); setNewDest(""); }}
+                className="bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">Ajouter</button>
+            </div>
+            <p className="text-xs text-gray-400 mt-2">La liste commune s'applique aux cafés sans liste spécifique.</p>
+          </div>
+
           {/* Purge données */}
           <div className="bg-white rounded-2xl shadow-sm border border-rose-100 p-5">
             <h3 className="font-semibold text-gray-800 mb-1">🗑️ Archivage &amp; purge des données</h3>
@@ -983,7 +1050,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     const SectionAchats = ({ cafe, refreshTick=0 }) => {
       const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
       const [confirmId,setConfirmId]=useState(null);
-      const [f,setF]=useState({date:new Date().toISOString().slice(0,10),fournisseur:"",destination:"TCAM+TA",montant:"",mode:"CB",no_facture:"",facture_teams:"non"});
+      const [destinations,setDestinations] = useState(()=>loadDestinations(cafe));
+      useEffect(()=>{
+        const h=()=>{ const d=loadDestinations(cafe); setDestinations(d); setF(x=>({...x,destination:d[0]||""})); };
+        window.addEventListener("destinations_updated",h);
+        return()=>window.removeEventListener("destinations_updated",h);
+      },[cafe]);
+      const [f,setF]=useState({date:new Date().toISOString().slice(0,10),fournisseur:"",destination:loadDestinations(cafe)[0]||"",montant:"",mode:"CB",no_facture:"",facture_teams:"non"});
       useEffect(()=>{loadData(cafe,"achats").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
       const submit=async()=>{ if(!f.fournisseur||!f.montant)return; const nr={id:Date.now(),date:f.date,semaine:getWeekForDate(f.date),mois:getMonthForDate(f.date),fournisseur:f.fournisseur,destination:f.destination,montant:parseFloat(f.montant),mode:f.mode,no_facture:f.no_facture,facture_teams:f.facture_teams}; const upd=[nr,...rows]; setRows(upd); setF(x=>({...x,fournisseur:"",montant:"",no_facture:""})); await saveData(cafe,"achats",upd); };
       const del=async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"achats",u); };
@@ -997,7 +1070,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               {[["Date","date","date"],["Fournisseur","fournisseur","text"],["N° Facture","no_facture","text"]].map(([l,k,t])=>(
                 <div key={k}><label className="text-xs text-gray-500 block mb-1">{l}</label><input type={t} value={f[k]} onChange={e=>setF(x=>({...x,[k]:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"/></div>
               ))}
-              <div><label className="text-xs text-gray-500 block mb-1">Destination</label><select value={f.destination} onChange={e=>setF(x=>({...x,destination:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300">{DESTINATIONS_ACHATS.map(d=><option key={d}>{d}</option>)}</select></div>
+              <div><label className="text-xs text-gray-500 block mb-1">Destination</label><select value={f.destination} onChange={e=>setF(x=>({...x,destination:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300">{destinations.map(d=><option key={d}>{d}</option>)}</select></div>
               <div><label className="text-xs text-gray-500 block mb-1">Montant (€)</label><input type="number" step="0.01" value={f.montant} onChange={e=>setF(x=>({...x,montant:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"/></div>
               <div><label className="text-xs text-gray-500 block mb-1">Facture sur Teams</label><select value={f.facture_teams} onChange={e=>setF(x=>({...x,facture_teams:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"><option value="oui">Oui</option><option value="non">Non</option></select></div>
             </div>
