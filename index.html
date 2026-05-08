@@ -423,36 +423,61 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       }
     };
 
+    // Mutex par clé (cafe:section) — empêche les DELETE+INSERT entrelacés
+    const _saveLocks  = new Map(); // clé → Promise en cours
+    const _savePending = new Map(); // clé → dernière data en attente
+
     const saveData = async (cafe, section, data) => {
       const key = cafe + ":" + section;
-      // 1. Cache mémoire immédiat — l'UI ne voit jamais de données périmées
+
+      // 1. Cache mémoire immédiat
       _memCache.set(key, data);
-      // 2. localStorage comme backup hors-ligne
+      // 2. localStorage backup
       try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(data)); } catch{}
-      // 3. Supabase : DELETE puis INSERT
-      window.dispatchEvent(new CustomEvent("daddy_save_start"));
-      try {
-        // Supprimer la ligne existante
-        await supaFetch(
-          `/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}`,
-          { method: "DELETE", headers: { "Prefer": "return=minimal" } }
-        );
-        // Insérer la nouvelle version
-        const res = await supaFetch("/rest/v1/daddy_data", {
-          method: "POST",
-          headers: { "Prefer": "return=minimal" },
-          body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
-        });
-        if (res === null) throw new Error("INSERT failed");
-        window.dispatchEvent(new CustomEvent("daddy_save_done"));
-        return true;
-      } catch(e) {
-        console.error("saveData error:", cafe, section, e.message);
-        _saveQueue.push({cafe, section, data, resolve: ()=>{}});
-        _flushQueue();
-        window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
-        return false;
+
+      // 3. Si une sauvegarde est déjà en cours pour cette clé :
+      //    on enregistre la dernière valeur en "pending" et on laisse
+      //    la sauvegarde en cours terminer, puis elle prendra la valeur pending.
+      if (_saveLocks.has(key)) {
+        _savePending.set(key, data);
+        return true; // l'UI est déjà à jour via le cache
       }
+
+      // 4. Acquérir le verrou et sauvegarder
+      const doSave = async (dataToSave) => {
+        window.dispatchEvent(new CustomEvent("daddy_save_start"));
+        try {
+          await supaFetch(
+            `/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}`,
+            { method: "DELETE", headers: { "Prefer": "return=minimal" } }
+          );
+          const res = await supaFetch("/rest/v1/daddy_data", {
+            method: "POST",
+            headers: { "Prefer": "return=minimal" },
+            body: JSON.stringify({ cafe, section, data: dataToSave, updated_at: new Date().toISOString() })
+          });
+          if (res === null) throw new Error("INSERT failed");
+          window.dispatchEvent(new CustomEvent("daddy_save_done"));
+
+          // Si une valeur plus récente est arrivée pendant qu'on sauvegardait → la sauvegarder aussi
+          if (_savePending.has(key)) {
+            const next = _savePending.get(key);
+            _savePending.delete(key);
+            await doSave(next);
+          }
+          return true;
+        } catch(e) {
+          console.error("saveData error:", cafe, section, e.message);
+          _saveQueue.push({cafe, section, data: dataToSave, resolve: ()=>{}});
+          _flushQueue();
+          window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
+          return false;
+        }
+      };
+
+      const lock = doSave(data).finally(() => { _saveLocks.delete(key); });
+      _saveLocks.set(key, lock);
+      return lock;
     };
     const invalidateCache = (cafe, section) => {
       if (cafe && section) _memCache.delete(cafe+":"+section);
@@ -616,7 +641,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.3 · Build du 02/05/2026 10:57</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.4 · Build du 08/05/2026 09:04</p>
             </div>
           </div>
         </div>
@@ -652,6 +677,11 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       const [msgType,setMsgType] = useState("ok"); // "ok" | "err"
       const [sending,setSending] = useState("");
       const [purgeConfirm,setPurgeConfirm] = useState(false);
+      const [recupCafe,setRecupCafe]       = useState("");
+      const [recupSection,setRecupSection] = useState("caisseta");
+      const [recupData,setRecupData]       = useState(null); // null=pas lu, []=vide, [...]= données
+      const [recupSupa,setRecupSupa]       = useState(null); // données actuelles dans Supabase
+      const [recupMsg,setRecupMsg]         = useState("");
       const [allDest,setAllDest] = useState(()=>loadAllDestinations());
       const [destCafe,setDestCafe] = useState("_default");
       const [newDest,setNewDest] = useState("");
@@ -875,6 +905,96 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 className="bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">Ajouter</button>
             </div>
             <p className="text-xs text-gray-400 mt-2">La liste commune s'applique aux cafés sans liste spécifique.</p>
+          </div>
+
+          {/* Récupération d'urgence */}
+          <div className="bg-white rounded-2xl shadow-sm border border-amber-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-1">🛟 Récupération d'urgence — données locales</h3>
+            <p className="text-xs text-gray-500 mb-4">
+              Chaque sauvegarde est automatiquement dupliquée dans le localStorage du navigateur.
+              En cas de perte de données dans Supabase, cette section permet de consulter et restaurer
+              le dernier état connu depuis <strong>ce navigateur</strong>.
+            </p>
+            <div className="flex flex-wrap gap-2 mb-3">
+              <select value={recupCafe} onChange={e=>{setRecupCafe(e.target.value);setRecupData(null);setRecupSupa(null);setRecupMsg("");}}
+                className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300">
+                <option value="">— Choisir un café —</option>
+                {cafes.map(c=><option key={c} value={c}>{c}</option>)}
+              </select>
+              <select value={recupSection} onChange={e=>{setRecupSection(e.target.value);setRecupData(null);setRecupSupa(null);setRecupMsg("");}}
+                className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300">
+                {["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective","carte"].map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+              <button disabled={!recupCafe} onClick={async()=>{
+                if(!recupCafe) return;
+                setRecupMsg("Lecture en cours…");
+                // Lire localStorage
+                const lsRaw = localStorage.getItem(`daddy_fb_${recupCafe}_${recupSection}`);
+                const lsData = lsRaw ? JSON.parse(lsRaw) : [];
+                setRecupData(lsData);
+                // Lire Supabase
+                const supaRows = await loadData(recupCafe, recupSection, true);
+                setRecupSupa(supaRows);
+                setRecupMsg("");
+              }} className="bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
+                🔍 Lire le backup local
+              </button>
+            </div>
+
+            {recupMsg&&<p className="text-sm text-amber-700 mb-2">{recupMsg}</p>}
+
+            {recupData!==null&&<>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-gray-500 mb-1">💾 Backup local (ce navigateur)</p>
+                  <p className="text-2xl font-bold text-amber-700">{recupData.length}</p>
+                  <p className="text-xs text-gray-500">ligne(s)</p>
+                </div>
+                <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-center">
+                  <p className="text-xs text-gray-500 mb-1">☁️ Supabase (actuel)</p>
+                  <p className="text-2xl font-bold text-blue-700">{recupSupa?recupSupa.length:"…"}</p>
+                  <p className="text-xs text-gray-500">ligne(s)</p>
+                </div>
+              </div>
+
+              {recupData.length > (recupSupa?.length||0) &&
+                <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 mb-3">
+                  <p className="text-sm font-semibold text-rose-700 mb-1">⚠️ Le backup local contient plus de données que Supabase !</p>
+                  <p className="text-xs text-gray-600">Local : {recupData.length} lignes — Supabase : {recupSupa?.length||0} lignes. Une restauration est probablement nécessaire.</p>
+                </div>}
+
+              {recupData.length === 0 &&
+                <p className="text-sm text-gray-500 italic mb-3">Aucun backup local trouvé pour cette section sur ce navigateur.</p>}
+
+              {recupData.length > 0 && <>
+                <div className="overflow-x-auto max-h-40 border border-gray-100 rounded-xl mb-3">
+                  <table className="w-full text-xs">
+                    <thead><tr className="bg-gray-50 border-b">{Object.keys(recupData[0]||{}).slice(0,6).map(k=><th key={k} className="px-2 py-1.5 text-left text-gray-500 font-semibold">{k}</th>)}</tr></thead>
+                    <tbody>{recupData.slice(0,8).map((r,i)=><tr key={i} className="border-b border-gray-50">{Object.keys(recupData[0]).slice(0,6).map(k=><td key={k} className="px-2 py-1.5 text-gray-700 truncate max-w-20">{String(r[k]??"")}</td>)}</tr>)}</tbody>
+                  </table>
+                  {recupData.length>8&&<p className="text-xs text-gray-400 px-2 py-1">… et {recupData.length-8} ligne(s) de plus</p>}
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  <button onClick={()=>{
+                    buildAndDownloadCSV(
+                      recupData.map(r=>({Café:recupCafe,Section:recupSection.toUpperCase(),...normalizeRow(r,recupSection)})),
+                      `BACKUP_${recupCafe}_${recupSection}_${new Date().toISOString().slice(0,10)}.csv`
+                    );
+                  }} className="bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
+                    📥 Exporter en CSV
+                  </button>
+                  <button onClick={async()=>{
+                    if(!window.confirm(`Restaurer ${recupData.length} ligne(s) dans Supabase pour ${recupCafe} / ${recupSection} ?\n\nCela écrasera les données actuelles de Supabase.`)) return;
+                    setRecupMsg("Restauration en cours…");
+                    const ok = await saveData(recupCafe, recupSection, recupData);
+                    setRecupMsg(ok ? `✅ ${recupData.length} ligne(s) restaurée(s) avec succès dans Supabase.` : "❌ Erreur lors de la restauration — réessayez.");
+                    if(ok) { const s=await loadData(recupCafe,recupSection,true); setRecupSupa(s); }
+                  }} className="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
+                    🔄 Restaurer dans Supabase
+                  </button>
+                </div>
+              </>}
+            </>}
           </div>
 
           {/* Purge données */}
