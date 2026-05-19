@@ -193,8 +193,13 @@
         if (r.client           !== undefined) out["client"]          = r.client;
         if (r.montant_devis    !== undefined) out["montant_devis"]   = r.montant_devis;
         if (r.devis_accepte    !== undefined) out["devis_accepte"]   = r.devis_accepte;
-        if (r.date_reglement   !== undefined) out["date"]            = r.date_reglement;  // date facture / règlement
         if (r.date_evenement   !== undefined) out["date_evenement"]  = r.date_evenement;
+        // date, semaine, mois = date de FACTURE (date_reglement)
+        if (r.date_reglement) {
+          out["date"]    = r.date_reglement;
+          out["semaine"] = getWeekForDate(r.date_reglement);
+          out["mois"]    = getMonthForDate(r.date_reglement);
+        }
       }
 
       // "Prix de vente unitaire" = prix public TTC (TA et RC uniquement)
@@ -668,7 +673,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.5 · Build du 19/05/2026 13:10</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.5 · Build du 19/05/2026 13:47</p>
             </div>
           </div>
         </div>
