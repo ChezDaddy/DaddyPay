@@ -236,8 +236,12 @@
 
     /* ── BUILD SUMMARY TEXT for email ── */
     const buildSummaryText = (rows, cafes, periodLabel) => {
-      // Les lignes passent par normalizeRow → colonne unifiée "montant TTC payé"
-      const sum = (arr) => arr.reduce((s,r)=>s+(parseFloat(r["montant TTC payé"])||0),0);
+      const sum    = (arr) => arr.reduce((s,r)=>s+(parseFloat(r["montant TTC payé"])||0),0);
+      // Somme par mode de paiement (hors Achats qui sont des charges)
+      const sumMode = (arr, mode) => arr
+        .filter(r=>r.Section!=="ACHATS" && r.mode===mode)
+        .reduce((s,r)=>s+(parseFloat(r["montant TTC payé"])||0),0);
+      const MODES_RAPPORT = ["CB","Espèces","Chèque","Virement"];
       let txt = `☕ Chez Daddy — Rapport ${periodLabel}\n`;
       txt += `Généré le ${new Date().toLocaleDateString("fr-FR")} à ${new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}\n`;
       txt += `Total lignes : ${rows.length}\n\n`;
@@ -262,6 +266,12 @@
         if (rc>0)  txt += `  RC         : ${rc.toFixed(2)} €\n`;
         if (adh>0) txt += `  Adhésions  : ${adh.toFixed(2)} €\n`;
         txt += `  ► TOTAL    : ${tot.toFixed(2)} €\n`;
+        // Modes de paiement (encaissements uniquement, hors achats)
+        txt += `  · Modes de paiement :\n`;
+        MODES_RAPPORT.forEach(m => {
+          const v = sumMode(cr, m);
+          if (v > 0) txt += `      ${m.padEnd(10)}: ${v.toFixed(2)} €\n`;
+        });
       });
       const gTA  = sum(rows.filter(r=>r.Section==="CAISSETA"));
       const gTC  = sum(rows.filter(r=>r.Section==="TCAM"));
@@ -279,6 +289,12 @@
       if (gRC>0)  txt += `  RC         : ${gRC.toFixed(2)} €\n`;
       if (gADH>0) txt += `  Adhésions  : ${gADH.toFixed(2)} €\n`;
       txt += `  ► ENCAISSÉ : ${(gTA+gTC+gDN+gPV+gRC+gADH).toFixed(2)} €\n`;
+      // Modes de paiement consolidés tous cafés
+      txt += `  · Modes de paiement :\n`;
+      MODES_RAPPORT.forEach(m => {
+        const v = sumMode(rows, m);
+        if (v > 0) txt += `      ${m.padEnd(10)}: ${v.toFixed(2)} €\n`;
+      });
       txt += `\nLe fichier CSV complet a été téléchargé automatiquement sur le poste de l'administrateur.`;
       return txt;
     };
@@ -641,7 +657,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.4 · Build du 08/05/2026 09:04</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.5 · Build du 19/05/2026 07:15</p>
             </div>
           </div>
         </div>
