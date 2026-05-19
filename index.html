@@ -160,8 +160,9 @@
     /* ── BUILD CSV STRING (sans téléchargement) ── */
     const CSV_COL_ORDER = [
       "Café","Section","date","semaine","mois",
-      "produit","evenement","fournisseur","typo","destination",
+      "produit","evenement","client","fournisseur","typo","destination",
       "qte","Prix de vente unitaire","HT_PU","tva_taux","tva_unitaire","tva_total","ht_total","montant TTC payé",
+      "montant_devis","devis_accepte","date_evenement",
       "mode","facture_teams","no_facture","commentaire","id"
     ];
     const sortedHeaders = (rows) => {
@@ -187,8 +188,16 @@
         if (r[k] !== undefined) out[k] = r[k];
       });
 
-      // "Prix de vente unitaire" = prix public TTC affiché sur la carte
-      // TA : prix_unitaire | RC : prix (champ carte) | autres : vide
+      // Colonnes spécifiques aux privatisations
+      if (section === "privatisation") {
+        if (r.client           !== undefined) out["client"]          = r.client;
+        if (r.montant_devis    !== undefined) out["montant_devis"]   = r.montant_devis;
+        if (r.devis_accepte    !== undefined) out["devis_accepte"]   = r.devis_accepte;
+        if (r.date_reglement   !== undefined) out["date"]            = r.date_reglement;  // date facture / règlement
+        if (r.date_evenement   !== undefined) out["date_evenement"]  = r.date_evenement;
+      }
+
+      // "Prix de vente unitaire" = prix public TTC (TA et RC uniquement)
       const puTTC = r.prix_unitaire ?? r.prix ?? null;
       if (puTTC !== null) out["Prix de vente unitaire"] = puTTC;
 
@@ -199,12 +208,13 @@
       if (r.tva_total    !== undefined) out["tva_total"]     = r.tva_total;
       if (r.ht_total     !== undefined) out["ht_total"]      = r.ht_total;
 
-      // "montant TTC payé" = pu_TTC * qte pour TA/RC, montant brut pour TCAM/Dons, -montant pour Achats
+      // "montant TTC payé"
       let montantTTC = null;
-      if (section === "caisseta")        montantTTC = r.prix_total ?? null;
+      if (section === "caisseta")            montantTTC = r.prix_total ?? null;
       else if (section === "restocollective") montantTTC = r.prix_total ?? r.montant ?? null;
-      else if (section === "achats")     montantTTC = r.montant != null ? -Math.abs(parseFloat(r.montant)||0) : null;
-      else                               montantTTC = r.montant ?? null; // TCAM, Dons, Privatisation
+      else if (section === "achats")         montantTTC = r.montant != null ? -Math.abs(parseFloat(r.montant)||0) : null;
+      else if (section === "privatisation")  montantTTC = r.montant_facture ?? null; // montant effectivement facturé
+      else                                   montantTTC = r.montant ?? null; // TCAM, Dons
       if (montantTTC !== null) out["montant TTC payé"] = montantTTC;
 
       return out;
@@ -591,11 +601,12 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
             if (montant === 0) return;
             flat.push({
               ...(cafe ? {Café: cafe} : {}),
-              Section: "ADHESION",
+              Section: type === "Individuelles" ? "ADH.INDIV." : "ADH.STRUCTURE",
               date: r.date,
               semaine: r.semaine,
               mois: r.mois,
               produit: `Adhésion ${type}`,
+              typo: type,          // "Individuelles" ou "Structure"
               mode: m,
               "montant TTC payé": montant,
             });
@@ -606,7 +617,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     };
 
     const exportToXLSX = (cafe, period, periodType, allData) => {
-      const fn = (row) => { if (!row.date) return false; if (periodType==="week") return row.semaine===period; if (periodType==="month") return row.mois===parseInt(period.replace("M","")); return true; };
+      const fn = (row) => { const d = row.date || row.date_evenement; if (!d) return false; if (periodType==="week") return row.semaine===period; if (periodType==="month") return row.mois===parseInt(period.replace("M","")); return true; };
       const rows = [];
       ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(), ...normalizeRow(r,s)})));
       explodeAdhesion((allData.adhesion||[]).filter(fn), cafe).forEach(r => rows.push({...r}));
@@ -657,7 +668,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.5 · Build du 19/05/2026 07:15</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v3.5 · Build du 19/05/2026 13:10</p>
             </div>
           </div>
         </div>
@@ -1483,7 +1494,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         weekly=WEEKS_2026.slice(0,20).map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); }); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh}; }).filter(r=>r.ta+r.tc+r.dn+r.ac+r.adh>0);
       } catch(wErr) { console.error("WEEKLY CRASH:", wErr.message); }
 
-      const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ if(!r.date)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),...normalizeRow(r,s)}))); explodeAdhesion((d.adhesion||[]).filter(fn),c).forEach(r=>rows.push({...r})); (d.restocollective||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:"RESTOCOLLECTIVE",...normalizeRow(r,"restocollective")})); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
+      const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; const rows=[]; cafes.forEach(c=>{ const d=allCafesData[c]||{}; const fn=r=>{ const d=r.date||r.date_evenement; if(!d)return false; if(ft==="week")return r.semaine===sw; if(ft==="month")return r.mois===sm; return true; }; ["caisseta","tcam","dons","achats","privatisation"].forEach(s=>(d[s]||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:s.toUpperCase(),...normalizeRow(r,s)}))); explodeAdhesion((d.adhesion||[]).filter(fn),c).forEach(r=>rows.push({...r})); (d.restocollective||[]).filter(fn).forEach(r=>rows.push({Café:c,Section:"RESTOCOLLECTIVE",...normalizeRow(r,"restocollective")})); }); buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`); };
 
 
 
