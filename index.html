@@ -1,12 +1,13 @@
 <!DOCTYPE html>
+<!-- DaddyPay v4.0.0 · Build du 22/06/2026 12:59 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>☕ Daddy'Pay — La solution caisse de Chez Daddy</title>
-  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
-  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone@7.29.7/babel.min.js"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
   <style>
@@ -37,11 +38,10 @@
         });
         clearTimeout(timer);
         if (!r.ok) { const t = await r.text().catch(()=>""); console.error("Supabase error", r.status, t); return null; }
-        // Lire le corps en texte brut d'abord : avec Prefer: return=minimal,
-        // le corps est vide (200/201/204 selon les cas) — r.json() plante alors systématiquement.
-        const txt = await r.text().catch(()=>"");
-        if (!txt) return true; // corps vide = succès (return=minimal)
-        try { return JSON.parse(txt); }
+        // 204 No Content (succès sans body)
+        if (r.status === 204) return true;
+        // Protéger r.json() contre les réponses vides ou tronquées (réseau instable)
+        try { return await r.json(); }
         catch(jsonErr) { console.error("supaFetch: réponse JSON invalide", jsonErr.message); return null; }
       } catch(e) {
         clearTimeout(timer);
@@ -57,9 +57,7 @@
       if (_saveRunning || _saveQueue.length===0) return;
       _saveRunning = true;
       while (_saveQueue.length > 0) {
-        const item = _saveQueue[0];
-        item._attempts = (item._attempts||0) + 1;
-        const {cafe, section, data, resolve} = item;
+        const {cafe, section, data, resolve} = _saveQueue[0];
         const res = await supaFetch("/rest/v1/daddy_data", {
           method: "POST",
           headers: { "Prefer": "resolution=merge-duplicates,return=minimal" },
@@ -68,13 +66,6 @@
         if (res !== null) {
           _saveQueue.shift();
           resolve(true);
-          // Le bandeau ne se referme que si la file est totalement vidée
-          if (_saveQueue.length === 0) window.dispatchEvent(new CustomEvent("daddy_save_done"));
-        } else if (item._attempts >= 6) {
-          // Échec persistant (>30s, 6 tentatives) — on arrête de boucler en silence
-          // et on signale clairement un blocage réel à l'utilisateur.
-          _saveQueue.shift();
-          window.dispatchEvent(new CustomEvent("daddy_save_stuck", { detail: { cafe, section } }));
         } else {
           // Réessayer dans 5s
           await new Promise(r=>setTimeout(r,5000));
@@ -187,6 +178,7 @@
     };
 
     /* ── BUILD CSV STRING (sans téléchargement) ── */
+    // Export ACTIVITÉS (café) — TA, TCAM, Dons, Achats, Privatisation, RC. Pas de colonnes adhérent.
     const CSV_COL_ORDER = [
       "Café","Section","date","semaine","mois",
       "produit","evenement","client","fournisseur","typo","destination",
@@ -194,12 +186,26 @@
       "montant_devis","devis_accepte","date_evenement",
       "mode","facture_teams","no_facture","commentaire","id","recorded_at"
     ];
-    const sortedHeaders = (rows) => {
-      // Toujours inclure toutes les colonnes de CSV_COL_ORDER (vides si absentes)
+    // Export ADHÉRENTS — structure dédiée avec 1 colonne par rôle additionnel × par date
+    // Colonnes fixes — les colonnes "Réseau : X" sont ajoutées dynamiquement à la fin
+    // selon les réseaux existants (voir buildAdherentsColOrder).
+    const CSV_COL_ORDER_ADHERENTS = [
+      "Café","Structure","civilite","prenom","nom","contact_nom","adresse","mail","telephone",
+      "date_naissance","annee_adhesion","Montant d'adhésion","mode de règlement",
+      "adhesion_offerte","renouvellement","de_passage","source_arrivee",
+      "roles_additionnels \"bénévole\"","Bénévole : date formation","Bénévole : date début","Bénévole : date fin",
+      "roles_additionnels \"Talentueux\"","Talentueux : date formation","Talentueux : date début","Talentueux : date fin",
+      "roles_additionnels \"Tisseur de Lien\"","Tisseur de Lien : date formation","Tisseur de Lien : date début","Tisseur de Lien : date fin",
+      "talents","id","created_le"
+    ];
+    // Construit la liste de colonnes complète : colonnes fixes + 1 colonne "Réseau : X" par réseau, en fin de fichier
+    const buildAdherentsColOrder = (reseauxNoms) => [...CSV_COL_ORDER_ADHERENTS, ...reseauxNoms.map(n=>`Réseau : ${n}`)];
+    const sortedHeaders = (rows, colOrder=CSV_COL_ORDER) => {
+      // Toujours inclure toutes les colonnes de colOrder (vides si absentes)
       // + les colonnes supplémentaires présentes dans les données
       const allKeys = [...new Set(rows.flatMap(r=>Object.keys(r)))];
-      const rest = allKeys.filter(k=>!CSV_COL_ORDER.includes(k));
-      return [...CSV_COL_ORDER, ...rest];
+      const rest = allKeys.filter(k=>!colOrder.includes(k));
+      return [...colOrder, ...rest];
     };
     const buildCSVString = (rows) => {
       if (!rows.length) return "";
@@ -214,7 +220,7 @@
       const out = {};
       // Colonnes directes sans renommage
       ["date","semaine","mois","produit","evenement","fournisseur","typo","destination",
-       "qte","mode","facture_teams","no_facture","commentaire","id","recorded_at"].forEach(k => {
+       "qte","mode","facture_teams","no_facture","commentaire","id","recorded_at","evenement_ta"].forEach(k => {
         if (r[k] !== undefined) out[k] = r[k];
       });
 
@@ -270,13 +276,13 @@
       return out;
     };
 
+    // Export ACTIVITÉS uniquement (TA, TCAM, Dons, Achats, Privatisation, RC) — pas de fiches adhérent.
     const collectAllData = async (cafes, filterFn) => {
       const rows = [];
       await Promise.all(cafes.map(async cafe => {
-        const [ct,tc,dn,ac,pv,adh,rc] = await Promise.all(["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective"].map(s=>loadData(cafe,s)));
+        const [ct,tc,dn,ac,pv,rc] = await Promise.all(["caisseta","tcam","dons","achats","privatisation","restocollective"].map(s=>loadData(cafe,s)));
         const all = [{s:"caisseta",d:ct},{s:"tcam",d:tc},{s:"dons",d:dn},{s:"achats",d:ac},{s:"privatisation",d:pv}];
         all.forEach(({s,d})=>d.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:s.toUpperCase(),...normalizeRow(r,s)})));
-        explodeAdhesion(adh.filter(filterFn), cafe).forEach(r=>rows.push({...r}));
         rc.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:"RESTOCOLLECTIVE",...normalizeRow(r,"restocollective")}));
       }));
       return rows;
@@ -443,9 +449,11 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
 
     /* ── STORAGE HELPERS ── */
     const WEEKS_2026 = (() => {
-      const weeks = []; let d = new Date("2025-12-29");
+      // Construction en heure LOCALE (pas via parsing ISO qui force UTC)
+      // pour que la comparaison avec `today` (mis à minuit local) soit cohérente.
+      const weeks = []; let d = new Date(2025, 11, 29, 0, 0, 0, 0); // 29/12/2025 00:00 local
       for (let i = 1; i <= 53; i++) {
-        const end = new Date(d); end.setDate(end.getDate() + 6);
+        const end = new Date(d); end.setDate(end.getDate() + 6); end.setHours(23,59,59,999);
         weeks.push({ label: `S${i}`, start: new Date(d), end });
         d.setDate(d.getDate() + 7);
       }
@@ -477,10 +485,6 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       }
     };
     testSupabase();
-
-    // Keep-alive : évite la mise en pause du projet Supabase (plan gratuit, 7j d'inactivité)
-    // Ping léger toutes les 4 minutes tant que l'appli reste ouverte dans le navigateur.
-    setInterval(() => { supaFetch("/rest/v1/daddy_data?limit=1&select=cafe"); }, 4 * 60 * 1000);
 
     const loadData = async (cafe, section, bypassCache=false) => {
       const key = cafe + ":" + section;
@@ -537,8 +541,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
             body: JSON.stringify({ cafe, section, data: dataToSave, updated_at: new Date().toISOString() })
           });
           if (res === null) throw new Error("INSERT failed");
-          // Le bandeau ne se referme que si aucune sauvegarde n'est encore bloquée en arrière-plan
-          if (_saveQueue.length === 0) window.dispatchEvent(new CustomEvent("daddy_save_done"));
+          window.dispatchEvent(new CustomEvent("daddy_save_done"));
 
           // Si une valeur plus récente est arrivée pendant qu'on sauvegardait → la sauvegarder aussi
           if (_savePending.has(key)) {
@@ -634,9 +637,9 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     const DESTINATIONS_ACHATS = loadDestinations(null);
 
     /* ── CSV EXPORT ── */
-    const buildAndDownloadCSV = (rows, filename) => {
+    const buildAndDownloadCSV = (rows, filename, colOrder=CSV_COL_ORDER) => {
       if (rows.length === 0) { alert("Aucune donnée à exporter pour cette période."); return; }
-      const headers = sortedHeaders(rows);
+      const headers = sortedHeaders(rows, colOrder);
       const escape  = (v) => { const s = (v === null || v === undefined) ? "" : String(v).replace(/[\r\n]+/g," "); return s.includes(";") || s.includes('"') ? `"${s.replace(/"/g,'""')}"` : s; };
       const csv = [headers.map(escape).join(";"), ...rows.map(r => headers.map(h => escape(r[h])).join(";"))].join("\n");
       const blob = new Blob(["\uFEFF" + csv], { type:"text/csv;charset=utf-8;" });
@@ -646,36 +649,86 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     };
     /* ── Explode adhesion rows into flat lines like other sections ── */
     const MODES_ADH_ALL = ["Espèces","CB","Chèque","Virement","Prélèvement"];
-    const explodeAdhesion = (rows, cafe) => {
-      const flat = [];
-      rows.forEach(r => {
-        ["Individuelles","Structure"].forEach(type => {
-          const pfx = type === "Individuelles" ? "indiv" : "struc";
-          MODES_ADH_ALL.forEach(m => {
-            const montant = parseFloat(r[`${pfx}_${m}`]) || 0;
-            if (montant === 0) return;
-            flat.push({
-              ...(cafe ? {Café: cafe} : {}),
-              Section: type === "Individuelles" ? "ADH.INDIV." : "ADH.STRUCTURE",
-              date: r.date,
-              semaine: r.semaine,
-              mois: r.mois,
-              produit: `Adhésion ${type}`,
-              typo: type,          // "Individuelles" ou "Structure"
-              mode: m,
-              "montant TTC payé": montant,
-            });
-          });
-        });
+    // Export CSV des fiches adhérent détaillées (v4.0.0)
+    // Export CSV dédié Adhérents — structure : 1 colonne par rôle additionnel × par date
+    // reseauxNoms : liste des noms de réseaux existants (actifs + inactifs) — chaque réseau devient
+    // une colonne dédiée oui/non en fin de fichier, pour permettre filtres et tableaux croisés.
+    const exportAdherents = (rows, cafe, reseauxNoms=[]) => {
+      const getRole = (r, roleName) => (r.roles_additionnels||[]).find(x=>x.role===roleName);
+      return rows.map(r => {
+        const benevole   = getRole(r, "Bénévole");
+        const talentueux = getRole(r, "Talentueux");
+        const tisseur    = getRole(r, "Tisseur de lien");
+        const out = {
+          Café: cafe || r.cafe,
+          Structure: r.structure ? "oui" : "non",
+          civilite: r.civilite,
+          prenom: r.prenom,
+          nom: r.nom?.toUpperCase(),
+          contact_nom: r.contact_nom,
+          adresse: r.adresse,
+          mail: r.mail,
+          telephone: r.telephone,
+          date_naissance: r.date_naissance,
+          annee_adhesion: r.annee_adhesion,
+          "Montant d'adhésion": parseFloat(r.montant) || 0,
+          "mode de règlement": r.mode_reglement,
+          adhesion_offerte: r.adhesion_offerte ? "oui" : "non",
+          renouvellement: r.renouvellement ? "oui" : "non",
+          de_passage: r.de_passage ? "oui" : "non",
+          source_arrivee: r.source_arrivee,
+          'roles_additionnels "bénévole"': benevole ? "oui" : "non",
+          "Bénévole : date formation": benevole?.date_formation || "",
+          "Bénévole : date début": benevole?.date_debut || "",
+          "Bénévole : date fin": benevole?.date_fin || "",
+          'roles_additionnels "Talentueux"': talentueux ? "oui" : "non",
+          "Talentueux : date formation": talentueux?.date_formation || "",
+          "Talentueux : date début": talentueux?.date_debut || "",
+          "Talentueux : date fin": talentueux?.date_fin || "",
+          'roles_additionnels "Tisseur de Lien"': tisseur ? "oui" : "non",
+          "Tisseur de Lien : date formation": tisseur?.date_formation || "",
+          "Tisseur de Lien : date début": tisseur?.date_debut || "",
+          "Tisseur de Lien : date fin": tisseur?.date_fin || "",
+          talents: r.talents||"",
+          id: r.id,
+          created_le: r.created_at ? r.created_at.slice(0,10).split("-").reverse().join("/") : "",
+        };
+        // Une colonne par réseau existant, en fin de fichier — oui/non
+        reseauxNoms.forEach(nom => { out[`Réseau : ${nom}`] = (r.reseaux||[]).includes(nom) ? "oui" : "non"; });
+        return out;
       });
-      return flat;
+    };
+    // Dérive un montant TCAM/adhésion classique conservé pour compatibilité ascendante (inutilisé v4.0.0+)
+    const explodeAdhesion = (rows, cafe) => [];
+
+    // Export CSV dédié Adhérents — filtré par année d'adhésion (v4.0.0)
+    // Café unique : exportAdherentsCSV(cafe, annee)
+    // Tous cafés  : exportAdherentsCSV(null, annee, cafes)
+    const exportAdherentsCSV = async (cafe, annee, cafesList=null) => {
+      const reseauxAll = await loadReseaux();
+      const reseauxNoms = reseauxAll.map(r=>r.nom);
+      let rows = [];
+      if (cafesList) {
+        await Promise.all(cafesList.map(async c => {
+          const adherents = await loadData(c, "adherents");
+          const filtered = (adherents||[]).filter(a => parseInt(a.annee_adhesion)===parseInt(annee));
+          exportAdherents(filtered, c, reseauxNoms).forEach(r => rows.push(r));
+        }));
+      } else {
+        const adherents = await loadData(cafe, "adherents");
+        const filtered = (adherents||[]).filter(a => parseInt(a.annee_adhesion)===parseInt(annee));
+        rows = exportAdherents(filtered, cafe, reseauxNoms);
+      }
+      if (rows.length === 0) { alert(`Aucun adhérent pour l'année ${annee}.`); return; }
+      const suffix = cafesList ? "GLOBAL" : cafe;
+      buildAndDownloadCSV(rows, `DaddyPay_Adherents_${suffix}_${annee}.csv`, buildAdherentsColOrder(reseauxNoms));
     };
 
+    // Export ACTIVITÉS café uniquement — pas de fiches adhérent (voir exportAdherentsCSV pour ça).
     const exportToXLSX = (cafe, period, periodType, allData) => {
       const fn = (row) => { const d = row.date || row.date_evenement; if (!d) return false; if (periodType==="week") return row.semaine===period; if (periodType==="month") return row.mois===parseInt(period.replace("M","")); return true; };
       const rows = [];
       ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(), ...normalizeRow(r,s)})));
-      explodeAdhesion((allData.adhesion||[]).filter(fn), cafe).forEach(r => rows.push({...r}));
       (allData.restocollective||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:"RESTOCOLLECTIVE", ...normalizeRow(r,"restocollective")}));
       buildAndDownloadCSV(rows, `DaddyCafe_${cafe}_${period}_${new Date().toISOString().slice(0,10)}.csv`);
     };
@@ -723,7 +776,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v3.6.2 · Build du 18/06/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.0.0 · Build du 22/06/2026 12:59</p>
             </div>
           </div>
         </div>
@@ -764,11 +817,17 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       const [recupData,setRecupData]       = useState(null); // null=pas lu, []=vide, [...]= données
       const [recupSupa,setRecupSupa]       = useState(null); // données actuelles dans Supabase
       const [recupMsg,setRecupMsg]         = useState("");
+      const [repairMsg,setRepairMsg]       = useState("");
+      const [repairRunning,setRepairRunning] = useState(false);
       const [allDest,setAllDest] = useState(()=>loadAllDestinations());
       const [destCafe,setDestCafe] = useState("_default");
       const [newDest,setNewDest] = useState("");
       const [tvaOptions,setTvaOptions] = useState(()=>loadTVACarte());
       const [newTva,setNewTva] = useState("");
+      const [reseauxList,setReseauxList] = useState([]);
+      const [newReseauNom,setNewReseauNom] = useState("");
+      useEffect(()=>{ loadReseaux().then(setReseauxList); },[]);
+      const saveReseauxAndRefresh = async (arr) => { setReseauxList(arr); await saveReseaux(arr); window.dispatchEvent(new CustomEvent("reseaux_updated")); };
       const getDestForCafe = (c) => {
         if (allDest[c] !== undefined) return allDest[c];
         if (c !== "_default" && allDest["_default"] !== undefined) return [...allDest["_default"]];
@@ -845,12 +904,17 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
         // Purge
         let deleted = 0;
         await Promise.all(cafes.map(async cafe=>{
-          await Promise.all(["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective"].map(async section=>{
+          await Promise.all(["caisseta","tcam","dons","achats","privatisation","restocollective"].map(async section=>{
             const data = await loadData(cafe, section);
             const kept = data.filter(r=>!r.date||new Date(r.date)>=cutoff);
             deleted += data.length - kept.length;
             await saveData(cafe, section, kept);
           }));
+          // Adhérents : filtre sur date_adhesion (pas date)
+          const adherents = await loadData(cafe, "adherents");
+          const keptAdh = adherents.filter(r=>!r.date_adhesion||new Date(r.date_adhesion)>=cutoff);
+          deleted += adherents.length - keptAdh.length;
+          await saveData(cafe, "adherents", keptAdh);
         }));
         setPurgeConfirm(false);
         setPurgeResult({deleted, cutoff: cutoff.toLocaleDateString("fr-FR"), exported: rows.length>0});
@@ -955,6 +1019,40 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             </div>
           </div>
 
+          {/* Réseaux adhérents (v4.0.0) */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-1">🌐 Réseaux adhérents ({reseauxList.length})</h3>
+            <p className="text-xs text-gray-500 mb-3">
+              Réseaux proposés via case à cocher dans la fiche adhérent (ex: réseau d'entraide, association partenaire…).
+              À ne pas confondre avec la <strong>Source d'arrivée</strong> (flyer, bouche à oreille, réseaux sociaux…) qui est une liste fixe non modifiable ici.
+              Un réseau avec une date de fin renseignée devient inactif et n'est plus proposé pour les nouvelles fiches.
+            </p>
+            <div className="space-y-2 mb-3">
+              {reseauxList.map((r,i)=>{
+                const inactif = !!r.date_fin;
+                return (
+                  <div key={i} className={`flex items-center gap-2 border rounded-xl p-2.5 ${inactif?"border-gray-200 bg-gray-50":"border-sky-200 bg-sky-50"}`}>
+                    <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${inactif?"bg-gray-200 text-gray-500":"bg-emerald-100 text-emerald-700"}`}>{inactif?"Inactif":"Actif"}</span>
+                    <span className="text-sm font-medium text-gray-700 flex-1">{r.nom}</span>
+                    <label className="text-xs text-gray-500">Début</label>
+                    <input type="date" value={r.date_debut||""} onChange={e=>{ const u=[...reseauxList]; u[i]={...u[i],date_debut:e.target.value}; saveReseauxAndRefresh(u); }} className="border border-gray-200 rounded-lg px-2 py-1 text-xs"/>
+                    <label className="text-xs text-gray-500">Fin</label>
+                    <input type="date" value={r.date_fin||""} onChange={e=>{ const u=[...reseauxList]; u[i]={...u[i],date_fin:e.target.value}; saveReseauxAndRefresh(u); }} className="border border-gray-200 rounded-lg px-2 py-1 text-xs"/>
+                    <button onClick={()=>{ if(!window.confirm(`Supprimer définitivement le réseau "${r.nom}" ?`))return; const u=reseauxList.filter((_,j)=>j!==i); saveReseauxAndRefresh(u); }} className="text-rose-400 hover:text-rose-600 text-sm px-2">✕</button>
+                  </div>
+                );
+              })}
+              {reseauxList.length===0 && <p className="text-sm text-gray-400 italic">Aucun réseau configuré pour le moment — ajoutez-en un ci-dessous.</p>}
+            </div>
+            <div className="flex gap-2">
+              <input value={newReseauNom} onChange={e=>setNewReseauNom(e.target.value)}
+                onKeyDown={e=>{ if(e.key==="Enter"&&newReseauNom.trim()){ saveReseauxAndRefresh([...reseauxList,{nom:newReseauNom.trim(),date_debut:new Date().toISOString().slice(0,10),date_fin:""}]); setNewReseauNom(""); }}}
+                placeholder="Nom du réseau…" className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"/>
+              <button onClick={()=>{ if(!newReseauNom.trim())return; saveReseauxAndRefresh([...reseauxList,{nom:newReseauNom.trim(),date_debut:new Date().toISOString().slice(0,10),date_fin:""}]); setNewReseauNom(""); }}
+                className="bg-sky-600 hover:bg-sky-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">Ajouter</button>
+            </div>
+          </div>
+
           {/* Taux TVA de la carte */}
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
             <h3 className="font-semibold text-gray-800 mb-1">🧾 Taux TVA disponibles sur la Carte</h3>
@@ -1025,6 +1123,46 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <p className="text-xs text-gray-400 mt-2">La liste commune s'applique aux cafés sans liste spécifique.</p>
           </div>
 
+          {/* Réparation des numéros de semaine manquants */}
+          <div className="bg-white rounded-2xl shadow-sm border border-orange-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-1">🔧 Réparer les numéros de semaine manquants</h3>
+            <p className="text-xs text-gray-500 mb-3">
+              Certaines lignes saisies avant le 22/06/2026 peuvent avoir un numéro de semaine vide (bug corrigé depuis).
+              Cet outil recalcule la semaine (et le mois) à partir de la date de chaque ligne, pour tous les cafés et toutes les sections concernées.
+              Les lignes qui ont déjà un numéro de semaine ne sont pas modifiées.
+            </p>
+            <button disabled={repairRunning} onClick={async()=>{
+              setRepairRunning(true); setRepairMsg("Analyse en cours…");
+              let totalFixed = 0, totalChecked = 0;
+              const sections = ["caisseta","tcam","dons","achats","privatisation"];
+              for (const c of cafes) {
+                for (const s of sections) {
+                  const rows = await loadData(c, s);
+                  if (!rows || rows.length===0) continue;
+                  let changed = false;
+                  const dateField = s==="privatisation" ? "date_reglement" : "date";
+                  const fixed = rows.map(r => {
+                    totalChecked++;
+                    if (r.semaine) return r;
+                    const d = r[dateField] || r.date_evenement;
+                    if (!d) return r;
+                    const sem = getWeekForDate(d);
+                    const mois = getMonthForDate(d);
+                    if (!sem) return r;
+                    changed = true; totalFixed++;
+                    return { ...r, semaine: sem, mois: mois };
+                  });
+                  if (changed) await saveData(c, s, fixed);
+                }
+              }
+              setRepairMsg(`✅ Terminé : ${totalFixed} ligne(s) corrigée(s) sur ${totalChecked} ligne(s) vérifiée(s).`);
+              setRepairRunning(false);
+            }} className="bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
+              {repairRunning?"⏳ Réparation en cours…":"🔧 Lancer la réparation"}
+            </button>
+            {repairMsg && <p className="text-sm text-gray-600 mt-2">{repairMsg}</p>}
+          </div>
+
           {/* Récupération d'urgence */}
           <div className="bg-white rounded-2xl shadow-sm border border-amber-100 p-5">
             <h3 className="font-semibold text-gray-800 mb-1">🛟 Récupération d'urgence — données locales</h3>
@@ -1041,7 +1179,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </select>
               <select value={recupSection} onChange={e=>{setRecupSection(e.target.value);setRecupData(null);setRecupSupa(null);setRecupMsg("");}}
                 className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300">
-                {["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective","carte"].map(s=><option key={s} value={s}>{s}</option>)}
+                {["caisseta","tcam","dons","achats","privatisation","adherents","restocollective","carte"].map(s=><option key={s} value={s}>{s}</option>)}
               </select>
               <button disabled={!recupCafe} onClick={async()=>{
                 if(!recupCafe) return;
@@ -1093,10 +1231,21 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   {recupData.length>8&&<p className="text-xs text-gray-400 px-2 py-1">… et {recupData.length-8} ligne(s) de plus</p>}
                 </div>
                 <div className="flex gap-2 flex-wrap">
-                  <button onClick={()=>{
+                  <button onClick={async()=>{
+                    const isAdh = recupSection==="adherents";
+                    let csvRows, colOrder;
+                    if (isAdh) {
+                      const reseauxNoms = (await loadReseaux()).map(r=>r.nom);
+                      csvRows = exportAdherents(recupData, recupCafe, reseauxNoms);
+                      colOrder = buildAdherentsColOrder(reseauxNoms);
+                    } else {
+                      csvRows = recupData.map(r=>({Café:recupCafe,Section:recupSection.toUpperCase(),...normalizeRow(r,recupSection)}));
+                      colOrder = CSV_COL_ORDER;
+                    }
                     buildAndDownloadCSV(
-                      recupData.map(r=>({Café:recupCafe,Section:recupSection.toUpperCase(),...normalizeRow(r,recupSection)})),
-                      `BACKUP_${recupCafe}_${recupSection}_${new Date().toISOString().slice(0,10)}.csv`
+                      csvRows,
+                      `BACKUP_${recupCafe}_${recupSection}_${new Date().toISOString().slice(0,10)}.csv`,
+                      colOrder
                     );
                   }} className="bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
                     📥 Exporter en CSV
@@ -1166,12 +1315,14 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [mode,setMode]=useState("CB"); const [panier,setPanier]=useState([]); const [selProd,setSelProd]=useState(""); const [loading,setLoading]=useState(true);
       const [confirmId,setConfirmId]=useState(null);
       const [montantDonne,setMontantDonne]=useState("");
+      const [evenementActif,setEvenementActif]=useState(false);
+      const [evenementTexte,setEvenementTexte]=useState("");
       useEffect(()=>{loadData(cafe,"caisseta").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
       const total = panier.reduce((s,l)=>s+l.prix_unitaire*l.qte,0);
       const add = (label) => { if(!label)return; const item=carte.find(c=>c.label===label); if(!item)return; setPanier(p=>{const ei=p.findIndex(l=>l.produit===label); if(ei>=0){const c=[...p];c[ei]={...c[ei],qte:c[ei].qte+1};return c;} return [...p,{produit:label,prix_unitaire:item.prix,qte:1,typo:item.type,tva_taux:item.tva_taux||"0",prix_ht:item.prix_ht||calcHT(item.prix,item.tva_taux||"0")}];}); setSelProd(""); };
       const upd = (i,d)=>setPanier(p=>{const c=[...p];c[i]={...c[i],qte:Math.max(1,c[i].qte+d)};return c;});
       const rem = (i)=>setPanier(p=>p.filter((_,j)=>j!==i));
-      const valider = async()=>{ if(!panier.length||!date)return; const now=Date.now(); const recAt=localDateTime(); const nr=panier.map((l,i)=>({id:now+i,date,semaine:getWeekForDate(date),mois:getMonthForDate(date),produit:l.produit,qte:l.qte,prix_unitaire:l.prix_unitaire,prix_total:parseFloat((l.prix_unitaire*l.qte).toFixed(2)),mode,typo:l.typo,...(l.tva_taux&&l.tva_taux!=="0"?{tva_taux:l.tva_taux,prix_ht:l.prix_ht}:{}),recorded_at:recAt})); const upd=[...nr,...rows]; setRows(upd); setPanier([]); setMontantDonne(""); await saveData(cafe,"caisseta",upd); };
+      const valider = async()=>{ if(!panier.length||!date)return; const now=Date.now(); const recAt=localDateTime(); const evt=(evenementActif&&evenementTexte.trim())?evenementTexte.trim().slice(0,20):null; const nr=panier.map((l,i)=>({id:now+i,date,semaine:getWeekForDate(date),mois:getMonthForDate(date),produit:l.produit,qte:l.qte,prix_unitaire:l.prix_unitaire,prix_total:parseFloat((l.prix_unitaire*l.qte).toFixed(2)),mode,typo:l.typo,...(l.tva_taux&&l.tva_taux!=="0"?{tva_taux:l.tva_taux,prix_ht:l.prix_ht}:{}),...(evt?{evenement_ta:evt}:{}),recorded_at:recAt})); const upd=[...nr,...rows]; setRows(upd); setPanier([]); setMontantDonne(""); await saveData(cafe,"caisseta",upd); };
       const del = async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"caisseta",u); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       const softs=carte.filter(c=>c.type==="Soft"), alcools=carte.filter(c=>c.type==="Alcool"), nourr=carte.filter(c=>c.type==="Snacking");
@@ -1179,8 +1330,15 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         <div className="space-y-6">
           {confirmId&&<ConfirmDialog msg="Confirmez-vous vouloir supprimer cette ligne ?" onOui={()=>del(confirmId)} onNon={()=>setConfirmId(null)}/>}
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
-            <h3 className="font-semibold text-gray-800 mb-4">🍺 Nouvelle commande TA</h3>
-            <div className="mb-4"><label className="text-xs text-gray-500 block mb-1">Date</label><input type="date" value={date} onChange={e=>setDate(e.target.value)} className="w-48 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300"/></div>
+            <h3 className="font-semibold text-gray-800 mb-4">🍸 Nouvelle commande TA</h3>
+            <div className="mb-4 flex flex-wrap items-end gap-4">
+              <div><label className="text-xs text-gray-500 block mb-1">Date</label><input type="date" value={date} onChange={e=>{setDate(e.target.value);setEvenementActif(false);setEvenementTexte("");}} className="w-48 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300"/></div>
+              <div className="flex items-center gap-2 pb-2">
+                <input type="checkbox" id="evtCheck" checked={evenementActif} onChange={e=>{setEvenementActif(e.target.checked); if(!e.target.checked) setEvenementTexte("");}} className="w-4 h-4 accent-emerald-500"/>
+                <label htmlFor="evtCheck" className="text-sm text-gray-600 cursor-pointer">📌 Déclarer un événement pour cette date</label>
+              </div>
+              {evenementActif&&<div><input type="text" maxLength={20} value={evenementTexte} onChange={e=>setEvenementTexte(e.target.value)} placeholder="Ex: Brocante" className="w-48 border-2 border-emerald-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300 bg-emerald-50"/><p className="text-xs text-gray-400 mt-0.5">{evenementTexte.length}/20</p></div>}
+            </div>
             <div className="mb-4 space-y-2">
               {[["Softs","teal",softs],["Alcools","amber",alcools],["Snacking","rose",nourr]].map(([lbl,col,items])=>(
                 <div key={lbl}><p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{lbl}</p>
@@ -1238,7 +1396,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
             <h3 className="font-semibold text-gray-800 mb-4">🏠 Nouveau TCAM</h3>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-              {[["Date","date","date"],["Événement (obligatoire)","evenement","text"],["Prix unitaire (€)","pu","number"],["Quantité","qte","number"]].map(([l,k,t])=>(
+              {[["Date","date","date"],["Événement","evenement","text"],["Prix unitaire (€)","pu","number"],["Quantité","qte","number"]].map(([l,k,t])=>(
                 <div key={k}><label className="text-xs text-gray-500 block mb-1">{l}</label><input type={t} step={t==="number"?"0.5":undefined} value={f[k]} onChange={e=>setF(x=>({...x,[k]:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300"/></div>
               ))}
               <div><label className="text-xs text-gray-500 block mb-1">Montant (€) <span className="text-gray-400">(si pas de qté)</span></label><input type="number" step="0.5" value={f.montant} onChange={e=>setF(x=>({...x,montant:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300"/></div>
@@ -1317,7 +1475,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
             <h3 className="font-semibold text-gray-800 mb-4">🛒 Nouvel achat</h3>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-              {[["Date","date","date"],["Fournisseur (obligatoire)","fournisseur","text"],["N° Facture","no_facture","text"]].map(([l,k,t])=>(
+              {[["Date","date","date"],["Fournisseur","fournisseur","text"],["N° Facture","no_facture","text"]].map(([l,k,t])=>(
                 <div key={k}><label className="text-xs text-gray-500 block mb-1">{l}</label><input type={t} value={f[k]} onChange={e=>setF(x=>({...x,[k]:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300"/></div>
               ))}
               <div><label className="text-xs text-gray-500 block mb-1">Destination</label><select value={f.destination} onChange={e=>setF(x=>({...x,destination:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300">{destinations.map(d=><option key={d}>{d}</option>)}</select></div>
@@ -1353,7 +1511,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <h3 className="font-semibold text-gray-800 mb-4">🎉 Nouvelle privatisation</h3>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
               <div><label className="text-xs text-gray-500 block mb-1">Date événement</label><input type="date" value={f.date_evenement} onChange={e=>setF(x=>({...x,date_evenement:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
-              <div><label className="text-xs text-gray-500 block mb-1">Client (obligatoire)</label><input type="text" value={f.client} onChange={e=>setF(x=>({...x,client:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
+              <div><label className="text-xs text-gray-500 block mb-1">Client</label><input type="text" value={f.client} onChange={e=>setF(x=>({...x,client:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
               <div><label className="text-xs text-gray-500 block mb-1">Montant HT devis (€)</label><input type="number" step="0.01" value={f.montant_devis} onChange={e=>setF(x=>({...x,montant_devis:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
               <div><label className="text-xs text-gray-500 block mb-1">Devis accepté</label><select value={f.devis_accepte} onChange={e=>setF(x=>({...x,devis_accepte:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"><option>OUI</option><option>NON</option><option>EN ATTENTE</option></select></div>
               <div><label className="text-xs text-gray-500 block mb-1">Montant facturé (€)</label><input type="number" step="0.01" value={f.montant_facture} onChange={e=>setF(x=>({...x,montant_facture:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
@@ -1374,14 +1532,16 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
     /* ── DASHBOARD ── */
     const Dashboard = ({ cafe, rcOn=false, refreshTick=0 }) => {
-      const [allData,setAllData]=useState({caisseta:[],tcam:[],dons:[],achats:[],privatisation:[],adhesion:[],restocollective:[]}); const [loading,setLoading]=useState(true);
+      const [allData,setAllData]=useState({caisseta:[],tcam:[],dons:[],achats:[],privatisation:[],adhesion:[],adherents:[],restocollective:[]}); const [loading,setLoading]=useState(true);
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
-      useEffect(()=>{ (async()=>{ setLoading(true); const [caisseta,tcam,dons,achats,privatisation,adhesion,restocollective]=await Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons"),loadData(cafe,"achats"),loadData(cafe,"privatisation"),loadData(cafe,"adhesion"),loadData(cafe,"restocollective")]); setAllData({caisseta,tcam,dons,achats,privatisation,adhesion,restocollective}); setLoading(false); })(); },[cafe, refreshTick]);
+      useEffect(()=>{ (async()=>{ setLoading(true); const [caisseta,tcam,dons,achats,privatisation,adherents,restocollective]=await Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons"),loadData(cafe,"achats"),loadData(cafe,"privatisation"),loadData(cafe,"adherents"),loadData(cafe,"restocollective")]); const adhesion=deriveAdhesionAgg(adherents||[]); setAllData({caisseta,tcam,dons,achats,privatisation,adhesion,adherents,restocollective}); setLoading(false); })(); },[cafe, refreshTick]);
       const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
       const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation),fADH=fil(allData.adhesion),fRC=fil(allData.restocollective);
       const tTA=sum(fTA),tTCAM=sum(fTCAM,"montant"),tD=sum(fD,"montant"),tA=sum(fA,"montant"),tP=sum(fP,"montant_facture"),tADH=sum(fADH,"total"),tRC=sum(fRC,"prix_total");
       const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; exportToXLSX(cafe,p,ft,allData); };
+      const [anneeAdh,setAnneeAdh]=useState(defaultAnneeAdhesion());
+      const handleExportAdherents=()=>exportAdherentsCSV(cafe,anneeAdh);
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       return (
         <div className="space-y-6">
@@ -1391,7 +1551,11 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               {ft==="week"&&<select value={sw} onChange={e=>setSw(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300">{WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}</select>}
               {ft==="month"&&<select value={sm} onChange={e=>setSm(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300">{MONTHS.map((m,i)=><option key={i} value={i+1}>{m}</option>)}</select>}
             </div>
-            <button onClick={handleExport} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors">📥 Exporter CSV</button>
+            <div className="flex gap-2 items-center flex-wrap">
+              <button onClick={handleExport} className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors">📥 Exporter CSV</button>
+              <select value={anneeAdh} onChange={e=>setAnneeAdh(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300">{[defaultAnneeAdhesion()-2,defaultAnneeAdhesion()-1,defaultAnneeAdhesion(),defaultAnneeAdhesion()+1].map(a=><option key={a} value={a}>{a}</option>)}</select>
+              <button onClick={handleExportAdherents} className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors">💛 Extraction CSV Adhérents</button>
+            </div>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
             <StatCard label="Total TA" value={`${tTA.toFixed(2)} €`} sub={`${fTA.length} lignes`} color="emerald"/>
@@ -1429,16 +1593,27 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           </div>
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
             <h4 className="text-sm font-semibold text-gray-700 mb-3">Récap. hebdomadaire</h4>
-            <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","RC","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
-            {(()=>{
+            <div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","RC","Achats","Total encaissé",""].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
+            <tbody>{(()=>{
               // Semaines par ordre décroissant depuis la semaine courante
               const curIdx = WEEKS_2026.findIndex(w=>w.label===getCurrentWeekLabel());
               const start = curIdx >= 0 ? curIdx : 0;
-              const weeksDesc = WEEKS_2026.slice(Math.max(0, start-19), start+1).slice().reverse();
+              const weeksDesc = WEEKS_2026.slice(Math.max(0, start-9), start+1).slice().reverse();
               const curLabel = getCurrentWeekLabel();
               const rowsToShow = weeksDesc.map(w=>{ const wTA=sum(allData.caisseta.filter(r=>r.semaine===w.label)),wTC=sum(allData.tcam.filter(r=>r.semaine===w.label),"montant"),wD=sum(allData.dons.filter(r=>r.semaine===w.label),"montant"),wA=sum(allData.achats.filter(r=>r.semaine===w.label),"montant"),wADH=sum(allData.adhesion.filter(r=>r.semaine===w.label),"total"),wRC=sum(allData.restocollective.filter(r=>r.semaine===w.label),"prix_total"); return {w,wTA,wTC,wD,wA,wADH,wRC}; }).filter(({w,wTA,wTC,wD,wA,wADH,wRC})=>w.label===curLabel||wTA+wTC+wD+wA+wADH+wRC>0);
-              return rowsToShow.map(({w,wTA,wTC,wD,wA,wADH,wRC})=><tr key={w.label} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{w.label}</td><td className="px-3 py-2 text-emerald-600">{wTA.toFixed(2)}€</td><td className="px-3 py-2 text-amber-600">{wTC.toFixed(2)}€</td><td className="px-3 py-2 text-rose-600">{wD.toFixed(2)}€</td><td className="px-3 py-2 text-indigo-600">{wADH.toFixed(2)}€</td><td className="px-3 py-2 text-orange-600">{wRC.toFixed(2)}€</td><td className="px-3 py-2 text-sky-600">-{wA.toFixed(2)}€</td><td className="px-3 py-2 font-bold text-gray-800">{(wTA+wTC+wD+wADH+wRC).toFixed(2)}€</td></tr>);
-            })()}</table></div>
+              const out=[];
+              rowsToShow.forEach(({w,wTA,wTC,wD,wA,wADH,wRC})=>{
+                out.push(<tr key={w.label} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{w.label}</td><td className="px-3 py-2 text-emerald-600">{wTA.toFixed(2)}€</td><td className="px-3 py-2 text-amber-600">{wTC.toFixed(2)}€</td><td className="px-3 py-2 text-rose-600">{wD.toFixed(2)}€</td><td className="px-3 py-2 text-indigo-600">{wADH.toFixed(2)}€</td><td className="px-3 py-2 text-orange-600">{wRC.toFixed(2)}€</td><td className="px-3 py-2 text-sky-600">-{wA.toFixed(2)}€</td><td className="px-3 py-2 font-bold text-gray-800">{(wTA+wTC+wD+wADH+wRC).toFixed(2)}€</td><td className="px-3 py-2"></td></tr>);
+                // 2ème ligne par événement TA distinct sur cette semaine
+                const evtRows = allData.caisseta.filter(r=>r.semaine===w.label && r.evenement_ta);
+                const evtLabels = [...new Set(evtRows.map(r=>r.evenement_ta))];
+                evtLabels.forEach(evtLabel=>{
+                  const evtTA = sum(evtRows.filter(r=>r.evenement_ta===evtLabel));
+                  out.push(<tr key={w.label+"_"+evtLabel} className="border-t border-gray-50 bg-emerald-50/30"><td className="px-3 py-2 text-gray-400">{w.label}</td><td className="px-3 py-2 text-emerald-600 font-semibold">{evtTA.toFixed(2)}€</td><td className="px-3 py-2 text-amber-600">0.00€</td><td className="px-3 py-2 text-rose-600">0.00€</td><td className="px-3 py-2 text-indigo-600">0.00€</td><td className="px-3 py-2 text-orange-600">0.00€</td><td className="px-3 py-2 text-sky-600">-0.00€</td><td className="px-3 py-2 text-gray-500">{evtTA.toFixed(2)}€</td><td className="px-3 py-2 text-gray-600 font-medium italic">{evtLabel}</td></tr>);
+                });
+              });
+              return out;
+            })()}</tbody></table></div>
           </div>
           {/* ── PNL ANNUEL ── */}
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
@@ -1488,6 +1663,74 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                         <td className={`px-3 py-2 text-right font-bold ${totMarge>=0?"text-emerald-700":"text-rose-700"}`}>{fmtPct(totMarge,totRec)}</td>
                       </tr>
                     </>;
+                  })()}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* ── SYNTHÈSE ADHÉRENTS ── */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+            <div className="px-5 py-3 bg-gray-50 border-b border-gray-100"><h4 className="text-sm font-semibold text-gray-700">💛 Adhérents par mois 2026</h4></div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead><tr className="bg-gray-50 border-b border-gray-100">
+                  <th className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold w-44">Indicateur</th>
+                  {MONTHS.map((m,i)=><th key={i} className="text-right px-2 py-2 text-gray-500 uppercase tracking-wide font-semibold">{m.slice(0,3).toUpperCase()}</th>)}
+                  <th className="text-right px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">TOTAL</th>
+                </tr></thead>
+                <tbody>
+                  {(()=>{
+                    const adherents = allData.adherents||[];
+                    const byMonthAdh = (arr, fn) => MONTHS.map((_,i)=>{ const mAdh=arr.filter(a=>getMonthForDate(a.date_adhesion)===i+1); return fn(mAdh); });
+                    const indiv = adherents.filter(a=>!a.structure);
+                    const struc = adherents.filter(a=>a.structure);
+                    const blocs = [
+                      {label:"Individuelles", data:indiv, color:"text-violet-700", colorV:"text-violet-600"},
+                      {label:"Structures",    data:struc, color:"text-amber-700",  colorV:"text-amber-600"},
+                    ];
+                    const rows = [];
+                    blocs.forEach(b=>{
+                      const totalM   = byMonthAdh(b.data, m=>m.length);
+                      const nouveauxM = byMonthAdh(b.data, m=>m.filter(a=>!a.renouvellement).length);
+                      const montantM  = byMonthAdh(b.data, m=>m.reduce((s,a)=>s+(parseFloat(a.montant)||0),0));
+                      const totTotal=totalM.reduce((a,c)=>a+c,0), totNouveaux=nouveauxM.reduce((a,c)=>a+c,0), totMontant=montantM.reduce((a,c)=>a+c,0);
+                      rows.push(<tr key={b.label+"_tot"} className="border-t-2 border-gray-100 hover:bg-gray-50">
+                        <td className={`px-3 py-2 font-semibold ${b.color}`}>{b.label} — Nb total</td>
+                        {totalM.map((v,i)=><td key={i} className={`px-2 py-2 text-right ${b.colorV}`}>{v||"—"}</td>)}
+                        <td className={`px-3 py-2 text-right font-bold ${b.color}`}>{totTotal}</td>
+                      </tr>);
+                      rows.push(<tr key={b.label+"_new"} className="hover:bg-gray-50">
+                        <td className="px-3 py-2 text-gray-600">{b.label} — Nb nouveaux</td>
+                        {nouveauxM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-gray-500">{v||"—"}</td>)}
+                        <td className="px-3 py-2 text-right font-semibold text-gray-700">{totNouveaux}</td>
+                      </tr>);
+                      rows.push(<tr key={b.label+"_mt"} className="border-b border-gray-100 hover:bg-gray-50">
+                        <td className="px-3 py-2 text-gray-600">{b.label} — Montant (€)</td>
+                        {montantM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-gray-500">{v>0?`${v.toFixed(0)}€`:"—"}</td>)}
+                        <td className="px-3 py-2 text-right font-semibold text-gray-700">{totMontant.toFixed(0)}€</td>
+                      </tr>);
+                    });
+                    // Totaux combinés (individuelles + structures)
+                    const totalAllM   = byMonthAdh(adherents, m=>m.length);
+                    const nouveauxAllM = byMonthAdh(adherents, m=>m.filter(a=>!a.renouvellement).length);
+                    const montantAllM  = byMonthAdh(adherents, m=>m.reduce((s,a)=>s+(parseFloat(a.montant)||0),0));
+                    rows.push(<tr key="tot_total" className="border-t-2 border-gray-200 bg-gray-50 hover:bg-gray-100">
+                      <td className="px-3 py-2 font-bold text-gray-800">TOUS — Nb total adhérents</td>
+                      {totalAllM.map((v,i)=><td key={i} className="px-2 py-2 text-right font-medium text-gray-800">{v||"—"}</td>)}
+                      <td className="px-3 py-2 text-right font-extrabold text-gray-900">{totalAllM.reduce((a,b)=>a+b,0)}</td>
+                    </tr>);
+                    rows.push(<tr key="tot_new" className="bg-gray-50 hover:bg-gray-100">
+                      <td className="px-3 py-2 font-bold text-gray-800">TOUS — Nb nouveaux adhérents</td>
+                      {nouveauxAllM.map((v,i)=><td key={i} className="px-2 py-2 text-right font-medium text-gray-800">{v||"—"}</td>)}
+                      <td className="px-3 py-2 text-right font-extrabold text-gray-900">{nouveauxAllM.reduce((a,b)=>a+b,0)}</td>
+                    </tr>);
+                    rows.push(<tr key="tot_mt" className="bg-gray-50 hover:bg-gray-100">
+                      <td className="px-3 py-2 font-bold text-gray-800">TOUS — Montant total (€)</td>
+                      {montantAllM.map((v,i)=><td key={i} className="px-2 py-2 text-right font-medium text-gray-800">{v>0?`${v.toFixed(0)}€`:"—"}</td>)}
+                      <td className="px-3 py-2 text-right font-extrabold text-gray-900">{montantAllM.reduce((a,b)=>a+b,0).toFixed(0)}€</td>
+                    </tr>);
+                    return rows;
                   })()}
                 </tbody>
               </table>
@@ -1586,6 +1829,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     const DashboardGlobal = ({ cafes, onCafeCreated, isAdmin, supaStatus=null, initialSubTab="dashboard", onSubTabChange=()=>{}, allCafesData={}, allCafesLoading=false, onForceRefresh=()=>{} }) => {
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
       const [subTab,setSubTab]=useState(initialSubTab);
+      const [anneeAdh,setAnneeAdh]=useState(defaultAnneeAdhesion());
+      const [adhFilter,setAdhFilter]=useState("all"); // "all" | "indiv" | "struc"
       useEffect(()=>{ if(initialSubTab!==subTab) setSubTab(initialSubTab); },[initialSubTab]);
 
       const forceRefresh = onForceRefresh;
@@ -1597,6 +1842,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const sum=(arr,k="prix_total")=>{ const r=safeArr(arr).reduce((s,r)=>s+(parseFloat(r[k])||0),0); return isFinite(r)?r:0; };
 
       // Guard : afficher spinner si données pas encore chargées — AVANT tout calcul
+      // (tous les hooks useState/useCallback sont déclarés AVANT ce guard pour respecter les règles des hooks)
       if (Object.keys(allCafesData).length === 0) {
         return <div className="p-12 text-center">
           <div className="text-4xl mb-4">⏳</div>
@@ -1613,7 +1859,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
       let weekly = [];
       try {
-        { const curIdx=WEEKS_2026.findIndex(w=>w.label===getCurrentWeekLabel()); const start=curIdx>=0?curIdx:0; const weeksDesc=WEEKS_2026.slice(Math.max(0,start-19),start+1).slice().reverse(); const _curLabel=getCurrentWeekLabel(); weekly=weeksDesc.map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); }); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh}; }).filter(r=>r.week===_curLabel||r.ta+r.tc+r.dn+r.ac+r.adh>0); }
+        { const curIdx=WEEKS_2026.findIndex(w=>w.label===getCurrentWeekLabel()); const start=curIdx>=0?curIdx:0; const weeksDesc=WEEKS_2026.slice(Math.max(0,start-9),start+1).slice().reverse(); const _curLabel=getCurrentWeekLabel(); weekly=weeksDesc.map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; const evtMap={}; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); (d.caisseta||[]).filter(r=>r.semaine===w.label&&r.evenement_ta).forEach(r=>{ evtMap[r.evenement_ta]=(evtMap[r.evenement_ta]||0)+(parseFloat(r.prix_total)||0); }); }); const evenements=Object.entries(evtMap).map(([label,montant])=>({label,montant})); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh,evenements}; }).filter(r=>r.week===_curLabel||r.ta+r.tc+r.dn+r.ac+r.adh>0); }
       } catch(wErr) { console.error("WEEKLY CRASH:", wErr.message); }
 
       const handleExport=async()=>{
@@ -1623,6 +1869,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const rows = await collectAllData(cafes, filterFn);
         buildAndDownloadCSV(rows,`DaddyCafe_GLOBAL_${p}_${new Date().toISOString().slice(0,10)}.csv`);
       };
+      const handleExportAdherents=()=>exportAdherentsCSV(null,anneeAdh,cafes);
 
 
 
@@ -1643,9 +1890,11 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 {ft==="week"&&<select value={sw} onChange={e=>setSw(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300">{WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}</select>}
                 {ft==="month"&&<select value={sm} onChange={e=>setSm(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300">{MONTHS.map((m,i)=><option key={i} value={i+1}>{m}</option>)}</select>}
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-2 items-center flex-wrap">
                 <button onClick={onForceRefresh} disabled={allCafesLoading} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors">{allCafesLoading?"⏳ Chargement…":"🔄 Actualiser"}</button>
                 <button onClick={handleExport} className="flex items-center gap-2 bg-gray-800 hover:bg-gray-900 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors">📥 Exporter CSV (tous cafés)</button>
+                <select value={anneeAdh} onChange={e=>setAnneeAdh(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300">{[defaultAnneeAdhesion()-2,defaultAnneeAdhesion()-1,defaultAnneeAdhesion(),defaultAnneeAdhesion()+1].map(a=><option key={a} value={a}>{a}</option>)}</select>
+                <button onClick={handleExportAdherents} className="flex items-center gap-2 bg-violet-600 hover:bg-violet-700 text-white px-4 py-2 rounded-xl text-sm font-medium transition-colors">💛 Extraction CSV Adhérents (tous cafés)</button>
               </div>
             </div>
             {/* KPIs */}
@@ -1708,8 +1957,12 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             </div>
             {/* Récap hebdo */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4"><h4 className="text-sm font-semibold text-gray-700 mb-3">Récap. hebdomadaire — tous cafés</h4>
-              {weekly.length===0?<p className="text-sm text-gray-400 text-center py-6">Aucune donnée</p>:<div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","Achats","Total encaissé"].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
-              <tbody>{weekly.map(r=><tr key={r.week} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{r.week}</td><td className="px-3 py-2 text-emerald-600">{(r.ta||0).toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">{(r.tc||0).toFixed(2)} €</td><td className="px-3 py-2 text-rose-600">{(r.dn||0).toFixed(2)} €</td><td className="px-3 py-2 text-indigo-600">{(r.adh||0).toFixed(2)} €</td><td className="px-3 py-2 text-sky-600">−{(r.ac||0).toFixed(2)} €</td><td className="px-3 py-2 font-bold text-gray-800">{(r.total||0).toFixed(2)} €</td></tr>)}</tbody></table></div>}
+              {weekly.length===0?<p className="text-sm text-gray-400 text-center py-6">Aucune donnée</p>:<div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="bg-gray-50">{["Semaine","TA","TCAM","Dons","Adhés.","Achats","Total encaissé",""].map(h=><th key={h} className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold">{h}</th>)}</tr></thead>
+              <tbody>{weekly.flatMap(r=>{
+                const base=<tr key={r.week} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{r.week}</td><td className="px-3 py-2 text-emerald-600">{(r.ta||0).toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">{(r.tc||0).toFixed(2)} €</td><td className="px-3 py-2 text-rose-600">{(r.dn||0).toFixed(2)} €</td><td className="px-3 py-2 text-indigo-600">{(r.adh||0).toFixed(2)} €</td><td className="px-3 py-2 text-sky-600">−{(r.ac||0).toFixed(2)} €</td><td className="px-3 py-2 font-bold text-gray-800">{(r.total||0).toFixed(2)} €</td><td className="px-3 py-2"></td></tr>;
+                const evtRows=(r.evenements||[]).map(e=><tr key={r.week+"_"+e.label} className="border-t border-gray-50 bg-emerald-50/30"><td className="px-3 py-2 text-gray-400">{r.week}</td><td className="px-3 py-2 text-emerald-600 font-semibold">{e.montant.toFixed(2)} €</td><td className="px-3 py-2 text-amber-600">0.00 €</td><td className="px-3 py-2 text-rose-600">0.00 €</td><td className="px-3 py-2 text-indigo-600">0.00 €</td><td className="px-3 py-2 text-sky-600">−0.00 €</td><td className="px-3 py-2 text-gray-500">{e.montant.toFixed(2)} €</td><td className="px-3 py-2 text-gray-600 font-medium italic">{e.label}</td></tr>);
+                return [base, ...evtRows];
+              })}</tbody></table></div>}
             </div>
             {/* ── PNL ANNUEL GLOBAL ── */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
@@ -1762,6 +2015,82 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 </table>
               </div>
             </div>
+
+            {/* ── SYNTHÈSE ADHÉRENTS — TOUS CAFÉS (regroupé par café) ── */}
+            <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+              <div className="px-5 py-3 bg-gray-50 border-b border-gray-100 flex items-center justify-between flex-wrap gap-2">
+                <h4 className="text-sm font-semibold text-gray-700">💛 Adhérents par café et par mois 2026</h4>
+                <div className="flex gap-1.5">
+                  {[["all","Tous"],["indiv","Individuelles"],["struc","Structures"]].map(([v,lbl])=>(
+                    <button key={v} onClick={()=>setAdhFilter(v)} className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${adhFilter===v?"bg-violet-500 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>{lbl}</button>
+                  ))}
+                </div>
+              </div>
+              {(()=>{
+                const moisSel = [...Array(12).keys()].map(i=>i+1);
+                const perCafeMonth = cafes.map(c=>{
+                  let adherents = (allCafesData[c]||{}).adherents||[];
+                  if (adhFilter==="indiv") adherents = adherents.filter(a=>!a.structure);
+                  if (adhFilter==="struc") adherents = adherents.filter(a=>a.structure);
+                  const totalM   = moisSel.map(m=>adherents.filter(a=>getMonthForDate(a.date_adhesion)===m).length);
+                  const nouveauxM = moisSel.map(m=>adherents.filter(a=>getMonthForDate(a.date_adhesion)===m && !a.renouvellement).length);
+                  const montantM  = moisSel.map(m=>adherents.filter(a=>getMonthForDate(a.date_adhesion)===m).reduce((s,a)=>s+(parseFloat(a.montant)||0),0));
+                  return { cafe:c, totalM, nouveauxM, montantM,
+                    totTotal: totalM.reduce((a,b)=>a+b,0), totNouveaux: nouveauxM.reduce((a,b)=>a+b,0), totMontant: montantM.reduce((a,b)=>a+b,0) };
+                });
+                const sumCol = (key) => moisSel.map((_,i)=>perCafeMonth.reduce((s,c)=>s+c[key][i],0));
+                const sumTotalM = sumCol("totalM"), sumNouveauxM = sumCol("nouveauxM"), sumMontantM = sumCol("montantM");
+                const grandTotal = perCafeMonth.reduce((s,c)=>s+c.totTotal,0);
+                const grandNouveaux = perCafeMonth.reduce((s,c)=>s+c.totNouveaux,0);
+                const grandMontant = perCafeMonth.reduce((s,c)=>s+c.totMontant,0);
+                const fmtN = (v) => v||"—";
+                const fmtE = (v) => v>0?`${v.toFixed(0)}€`:"—";
+                return (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="bg-gray-50 border-b border-gray-100">
+                          <th className="text-left px-3 py-2 text-gray-700 uppercase tracking-wide font-bold w-32">Café</th>
+                          <th className="text-left px-3 py-2 text-gray-500 uppercase tracking-wide font-semibold w-40">Indicateur</th>
+                          {MONTHS.map((m,i)=><th key={i} className="text-right px-2 py-2 text-gray-500 uppercase tracking-wide font-semibold">
+                            {m.slice(0,3).toUpperCase()}<br/>
+                            <span className="text-violet-700 font-bold">{sumTotalM[i]}</span> / <span className="text-sky-700 font-bold">{sumNouveauxM[i]}</span><br/>
+                            <span className="text-gray-700 font-bold">{fmtE(sumMontantM[i])}</span>
+                          </th>)}
+                          <th className="text-right px-3 py-2 text-gray-700 uppercase tracking-wide font-bold">
+                            TOTAL<br/>
+                            <span className="text-violet-700 font-extrabold">{grandTotal}</span> / <span className="text-sky-700 font-extrabold">{grandNouveaux}</span><br/>
+                            <span className="text-gray-800 font-extrabold">{fmtE(grandMontant)}</span>
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {perCafeMonth.map(c=>(
+                          <React.Fragment key={c.cafe}>
+                            <tr className="border-t-2 border-gray-100 hover:bg-gray-50">
+                              <td rowSpan={3} className="px-3 py-2 font-semibold text-gray-800 align-top border-r border-gray-50">{c.cafe}</td>
+                              <td className="px-3 py-2 text-violet-700">Nb total adhérents</td>
+                              {c.totalM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-violet-600">{fmtN(v)}</td>)}
+                              <td className="px-3 py-2 text-right font-bold text-violet-700">{c.totTotal}</td>
+                            </tr>
+                            <tr className="hover:bg-gray-50">
+                              <td className="px-3 py-2 text-sky-700">Nb nouveaux adhérents</td>
+                              {c.nouveauxM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-sky-600">{fmtN(v)}</td>)}
+                              <td className="px-3 py-2 text-right font-bold text-sky-700">{c.totNouveaux}</td>
+                            </tr>
+                            <tr className="border-b border-gray-100 hover:bg-gray-50">
+                              <td className="px-3 py-2 text-gray-600">Montant adhésions (€)</td>
+                              {c.montantM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-gray-700">{fmtE(v)}</td>)}
+                              <td className="px-3 py-2 text-right font-bold text-gray-800">{fmtE(c.totMontant)}</td>
+                            </tr>
+                          </React.Fragment>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })()}
+            </div>
           </>}
         </div>
       );
@@ -1769,136 +2098,399 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
     /* ── SECTION ADHÉSION ── */
     const MODES_ADH = ["Espèces","CB","Chèque","Virement","Prélèvement"];
+    const ROLES_ADDITIONNELS = ["Bénévole","Talentueux","Tisseur de lien"];
+    const SOURCES_ARRIVEE = ["flyer / magazine","en passant / vitrine","bouche à oreille","réseaux sociaux"];
+
+    // Année d'adhésion par défaut : année en cours (jan-nov), année suivante en décembre
+    const defaultAnneeAdhesion = () => { const d=new Date(); return d.getMonth()===11 ? d.getFullYear()+1 : d.getFullYear(); };
+
+    // Réseaux configurables (Admin) — stockés dans Supabase (cafe="_config", section="reseaux")
+    const loadReseaux = async () => { const r = await loadData("_config","reseaux"); return r||[]; };
+    const saveReseaux = async (arr) => { await saveData("_config","reseaux",arr); };
+
+    const mkAdherentForm = () => ({
+      id: null,
+      date_adhesion: new Date().toISOString().slice(0,10),
+      structure: false,
+      civilite: "Mme",
+      prenom: "",
+      nom: "",
+      contact_nom: "",
+      adresse: "",
+      mail: "",
+      telephone: "",
+      date_naissance: "",
+      annee_adhesion: defaultAnneeAdhesion(),
+      cafe: "",
+      montant: "",
+      adhesion_offerte: false,
+      renouvellement: false,
+      reseaux: [],
+      de_passage: false,
+      source_arrivee: "",
+      mode_reglement: "CB",
+      roles_additionnels: [],   // [{role, date_formation, date_debut, date_fin}]
+      talents: "",
+    });
+
+    const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const isValidEmail = (s) => !s || EMAIL_RE.test(s.trim());
+    // Téléphone FR : 0X XX XX XX XX (espaces/points/tirets tolérés) ou +33 X XX XX XX XX
+    const TEL_FR_RE = /^(0[1-9]([\s.\-]?\d{2}){4}|\+33[\s.\-]?[1-9]([\s.\-]?\d{2}){4})$/;
+    const isValidTelFR = (s) => !s || TEL_FR_RE.test(s.trim());
+
+    // Dérive les anciens champs agrégés (total, indiv_{mode}, struc_{mode}) par semaine
+    // depuis la liste détaillée d'adhérents — pour compatibilité avec Dashboard/P&L existants.
+    const deriveAdhesionAgg = (adherents) => {
+      const bySemaine = {};
+      adherents.forEach(a => {
+        const sem = getWeekForDate(a.date_adhesion) || "";
+        if (!bySemaine[sem]) {
+          bySemaine[sem] = { semaine: sem, mois: getMonthForDate(a.date_adhesion), total: 0 };
+          MODES_ADH.forEach(m => { bySemaine[sem][`indiv_${m}`]=0; bySemaine[sem][`struc_${m}`]=0; });
+        }
+        const montant = parseFloat(a.montant) || 0;
+        // Une adhésion offerte (don>50€) est exclue du total adhésions mais incluse dans le total "incluant offertes"
+        if (!a.adhesion_offerte) {
+          const pfx = a.structure ? "struc" : "indiv";
+          bySemaine[sem][`${pfx}_${a.mode_reglement}`] = (bySemaine[sem][`${pfx}_${a.mode_reglement}`]||0) + montant;
+          bySemaine[sem].total += montant;
+        }
+      });
+      return Object.values(bySemaine);
+    };
     const mkAdhForm = () => ({
       semaine: getCurrentWeekLabel(),
       indiv_Espèces:"", indiv_CB:"", indiv_Chèque:"", indiv_Virement:"", indiv_Prélèvement:"",
       struc_Espèces:"", struc_CB:"", struc_Chèque:"", struc_Virement:"", struc_Prélèvement:"",
     });
 
-    const SectionAdhesion = ({ cafe, refreshTick=0 }) => {
-      const [rows,setRows]   = useState([]);
-      const [form,setForm]   = useState(mkAdhForm());
-      const [loading,setLoading] = useState(true);
-      const [confirmId,setConfirmId] = useState(null);
+    const SectionAdhesion = ({ cafe, refreshTick=0, cafes=[] }) => {
+      const [rows,setRows]=useState([]); const [loading,setLoading]=useState(true);
+      const [form,setForm]=useState(()=>({...mkAdherentForm(), cafe}));
+      const [editId,setEditId]=useState(null);
+      const [reseaux,setReseaux]=useState([]);
+      const [filters,setFilters]=useState({});
+      const [sortCol,setSortCol]=useState(null);
+      const [sortDir,setSortDir]=useState("asc"); // "asc" | "desc"
+      const [dupAlert,setDupAlert]=useState(null); // { matches:[...], pendingForm }
+      const [telConfirm,setTelConfirm]=useState(false); // true = utilisateur a confirmé un numéro non FR
 
-      useEffect(()=>{ loadData(cafe,"adhesion").then(d=>{ setRows(d); setLoading(false); }); },[cafe,refreshTick]);
-
-      const totalIndiv = MODES_ADH.reduce((s,m)=>s+(parseFloat(form[`indiv_${m}`])||0),0);
-      const totalStruc = MODES_ADH.reduce((s,m)=>s+(parseFloat(form[`struc_${m}`])||0),0);
-
-      const submit = async () => {
-        if (!form.semaine) return;
-        const nr = {
-          id: Date.now(),
-          semaine: form.semaine,
-          mois: (() => { const w=WEEKS_2026.find(w=>w.label===form.semaine); return w ? w.start.getMonth()+1 : null; })(),
-          date: (() => { const w=WEEKS_2026.find(w=>w.label===form.semaine); return w ? w.start.toISOString().slice(0,10) : ""; })(),
-        };
-        MODES_ADH.forEach(m=>{
-          nr[`indiv_${m}`] = parseFloat(form[`indiv_${m}`])||0;
-          nr[`struc_${m}`] = parseFloat(form[`struc_${m}`])||0;
+      useEffect(()=>{
+        setLoading(true);
+        Promise.all([loadData(cafe,"adherents"), loadReseaux()]).then(([d,r])=>{
+          setRows(d||[]); setReseaux((r||[]).filter(x=>!x.date_fin));
+          setLoading(false);
         });
-        nr.total_indiv = totalIndiv;
-        nr.total_struc = totalStruc;
-        nr.total       = totalIndiv + totalStruc;
-        const upd = [nr,...rows];
-        setRows(upd);
-        await saveData(cafe,"adhesion",upd);
-        setForm(mkAdhForm());
+      },[cafe,refreshTick]);
+      useEffect(()=>{
+        const h=()=>loadReseaux().then(r=>setReseaux((r||[]).filter(x=>!x.date_fin)));
+        window.addEventListener("reseaux_updated",h);
+        return()=>window.removeEventListener("reseaux_updated",h);
+      },[]);
+
+      const resetForm = () => { setForm({...mkAdherentForm(), cafe}); setEditId(null); setTelConfirm(false); };
+
+      // ── Dédoublonnage ──
+      const norm = (s) => (s||"").trim().toLowerCase();
+      const findDuplicates = (f, allRows) => {
+        return allRows.filter(r => {
+          if (editId && r.id===editId) return false;
+          const sameNomPrenom = norm(r.nom)===norm(f.nom) && norm(r.prenom)===norm(f.prenom) && norm(f.nom);
+          const sameNomEmail  = norm(r.nom)===norm(f.nom) && norm(r.mail)===norm(f.mail) && norm(f.mail);
+          const samePrenomEmail = norm(r.prenom)===norm(f.prenom) && norm(r.mail)===norm(f.mail) && norm(f.mail);
+          const sameTel = norm(r.telephone)===norm(f.telephone) && norm(f.telephone);
+          return sameNomPrenom || sameNomEmail || samePrenomEmail || sameTel;
+        });
       };
 
-      const del = async (id) => { setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"adhesion",u); };
+      const doSave = async (f, allRows) => {
+        const nr = { ...f, id: f.id || Date.now(), created_at: f.created_at || localDateTime() };
+        const upd = f.id ? allRows.map(r=>r.id===f.id?nr:r) : [nr, ...allRows];
+        setRows(upd); setLoading(false);
+        await saveData(cafe,"adherents",upd);
+        resetForm();
+      };
 
-      if(loading) return <div className="p-8 text-center text-gray-400">Chargement...</div>;
+      const submit = async () => {
+        if (!form.nom.trim()) { alert("Le nom est obligatoire."); return; }
+        if (!form.structure && !form.prenom.trim()) { alert("Le prénom est obligatoire pour une adhésion individuelle."); return; }
+        if (!isValidEmail(form.mail)) { alert("L'adresse mail n'est pas valide."); return; }
+        if (form.structure && !form.adresse.trim()) { alert("L'adresse est obligatoire pour une structure."); return; }
+        if (form.structure && !isValidEmail(form.mail)) { alert("Le mail est obligatoire pour une structure."); return; }
+
+        if (form.telephone.trim() && !isValidTelFR(form.telephone) && !telConfirm) {
+          if (!window.confirm(`Le numéro "${form.telephone}" ne ressemble pas à un numéro français standard.\n\nConfirmez-vous cette saisie (par exemple un numéro étranger) ?`)) return;
+          setTelConfirm(true);
+        }
+
+        const dups = findDuplicates(form, rows);
+        if (dups.length > 0 && !dupAlert) {
+          setDupAlert({ matches: dups, pendingForm: form });
+          return;
+        }
+        setDupAlert(null);
+        await doSave(form, rows);
+      };
+
+      const editRow = (r) => { setForm(r); setEditId(r.id); window.scrollTo({top:0,behavior:"smooth"}); };
+      const delRow = async (id) => { if(!window.confirm("Confirmez-vous la suppression de cette fiche adhérent ?"))return; const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"adherents",u); };
+
+      const toggleArr = (arr, val) => arr.includes(val) ? arr.filter(x=>x!==val) : [...arr, val];
+      const toggleRole = (role) => {
+        setForm(f => {
+          const has = f.roles_additionnels.some(r=>r.role===role);
+          if (has) return {...f, roles_additionnels: f.roles_additionnels.filter(r=>r.role!==role)};
+          return {...f, roles_additionnels: [...f.roles_additionnels, {role, date_formation:"", date_debut:"", date_fin:""}]};
+        });
+      };
+      const updRole = (role, field, val) => setForm(f=>({...f, roles_additionnels: f.roles_additionnels.map(r=>r.role===role?{...r,[field]:val}:r)}));
+
+      // ── Filtres sur toutes les colonnes ──
+      const getRoleInfo = (r, roleName) => (r.roles_additionnels||[]).find(x=>x.role===roleName);
+      const filteredRows = rows.filter(r => {
+        return Object.entries(filters).every(([k,v]) => {
+          if (!v) return true;
+          if (k==="structure") return v==="oui" ? r.structure : !r.structure;
+          if (k==="renouvellement"||k==="de_passage"||k==="adhesion_offerte") return v==="oui" ? !!r[k] : !r[k];
+          const val = r[k];
+          return String(val??"").toLowerCase().includes(v.toLowerCase());
+        });
+      }).sort((a,b) => {
+        if (!sortCol) return (b.created_at||"").localeCompare(a.created_at||""); // défaut : plus récents en haut
+        let va = a[sortCol], vb = b[sortCol];
+        if (sortCol==="montant") { va = parseFloat(va)||0; vb = parseFloat(vb)||0; }
+        else { va = String(va??"").toLowerCase(); vb = String(vb??"").toLowerCase(); }
+        const cmp = va < vb ? -1 : va > vb ? 1 : 0;
+        return sortDir==="asc" ? cmp : -cmp;
+      });
+
+      const toggleSort = (k) => {
+        if (sortCol===k) setSortDir(d=>d==="asc"?"desc":"asc");
+        else { setSortCol(k); setSortDir("asc"); }
+      };
+      const sortIcon = (k) => sortCol===k ? (sortDir==="asc"?" ▲":" ▼") : "";
+
+      if (loading) return <div className="p-8 text-center text-gray-400">Chargement...</div>;
+
+      const COLS = [
+        {k:"date_adhesion", label:"Date adh.", w:"w-24"},
+        {k:"structure", label:"Structure", w:"w-20", type:"select", options:[["oui","Structure"],["non","Indiv."]]},
+        {k:"civilite", label:"Civ.", w:"w-16", type:"select", options:[["Mme","Mme"],["M.","M."]]},
+        {k:"prenom", label:"Prénom", w:"w-28", sortable:true},
+        {k:"nom", label:"NOM", w:"w-28", sortable:true},
+        {k:"contact_nom", label:"Contact", w:"w-28", sortable:true},
+        {k:"adresse", label:"Adresse", w:"w-36"},
+        {k:"mail", label:"Mail", w:"w-36"},
+        {k:"telephone", label:"Tél.", w:"w-28"},
+        {k:"date_naissance", label:"Naiss.", w:"w-24"},
+        {k:"annee_adhesion", label:"Année", w:"w-20"},
+        {k:"cafe", label:"Café", w:"w-24", type:"select", options:cafes.map(c=>[c,c])},
+        {k:"montant", label:"Montant", w:"w-20", sortable:true},
+        {k:"mode_reglement", label:"Mode", w:"w-20", type:"select", options:MODES_ADH.map(m=>[m,m])},
+        {k:"adhesion_offerte", label:"Offerte", w:"w-20", type:"select", options:[["oui","Oui"],["non","Non"]]},
+        {k:"renouvellement", label:"Renouv.", w:"w-20", type:"select", options:[["oui","Oui"],["non","Non"]]},
+        {k:"reseaux", label:"Réseaux", w:"w-28"},
+        {k:"de_passage", label:"Passage", w:"w-20", type:"select", options:[["oui","Oui"],["non","Non"]]},
+        {k:"source_arrivee", label:"Source", w:"w-28", type:"select", options:SOURCES_ARRIVEE.map(s=>[s,s])},
+        {k:"_role_benevole", label:"Bénévole", w:"w-24"},
+        {k:"_role_talentueux", label:"Talentueux", w:"w-24"},
+        {k:"_role_tisseur", label:"Tisseur lien", w:"w-24"},
+        {k:"talents", label:"Talents", w:"w-32"},
+        {k:"created_at", label:"Créé le", w:"w-28"},
+      ];
 
       return (
         <div className="space-y-6">
-          {confirmId&&<ConfirmDialog msg="Confirmez-vous vouloir supprimer cette ligne ?" onOui={()=>del(confirmId)} onNon={()=>setConfirmId(null)}/>}
+          {/* Alerte doublons */}
+          {dupAlert && (
+            <div className="bg-rose-50 border-2 border-rose-300 rounded-2xl p-5 space-y-3">
+              <p className="font-semibold text-rose-800">⚠️ Doublon(s) potentiel(s) détecté(s)</p>
+              <p className="text-sm text-rose-700">Des adhérents existants ressemblent à cette fiche. Vous pouvez compléter une fiche existante ou confirmer la création d'une nouvelle fiche.</p>
+              <div className="space-y-2">
+                {dupAlert.matches.map(m=>(
+                  <div key={m.id} className="bg-white border border-rose-200 rounded-xl p-3 flex justify-between items-center">
+                    <div className="text-sm">
+                      <p className="font-medium text-gray-800">{m.civilite} {m.prenom} {m.nom?.toUpperCase()}</p>
+                      <p className="text-xs text-gray-500">{m.mail} · {m.telephone} · Adhésion {m.annee_adhesion}</p>
+                    </div>
+                    <button onClick={()=>{ setForm({...m, id:m.id}); setEditId(m.id); setDupAlert(null); }}
+                      className="bg-amber-100 hover:bg-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-xs font-semibold">Compléter cette fiche</button>
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button onClick={async()=>{ await doSave(dupAlert.pendingForm, rows); setDupAlert(null); }} className="bg-rose-600 hover:bg-rose-700 text-white px-4 py-2 rounded-lg text-sm font-semibold">Créer quand même une nouvelle fiche</button>
+                <button onClick={()=>setDupAlert(null)} className="text-sm text-gray-500 hover:text-gray-700 px-4 py-2">Annuler</button>
+              </div>
+            </div>
+          )}
 
-          {/* Titre informatif */}
-          <div className="bg-amber-50 border border-amber-200 rounded-2xl px-5 py-3 flex items-start gap-3">
-            <span className="text-amber-500 text-lg mt-0.5">ℹ️</span>
-            <div>
-              <p className="font-semibold text-amber-800 text-sm">🤝 Adhésions</p>
-              <p className="text-xs text-amber-700 mt-0.5">Renseignements portés ici à titre informatif. Ces montants sont remontés dans les dashboards et le P&L.</p>
+          {/* Formulaire fiche adhérent */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
+            <h3 className="font-semibold text-gray-800 mb-4">{editId ? "✏️ Modifier l'adhérent" : "💛 Nouvel adhérent"}</h3>
+
+            <div className="flex items-center gap-2 mb-4">
+              <input type="checkbox" id="structCheck" checked={form.structure} onChange={e=>setForm(f=>({...f,structure:e.target.checked}))} className="w-4 h-4 accent-indigo-500"/>
+              <label htmlFor="structCheck" className="text-sm font-medium text-gray-700 cursor-pointer">Structure (entreprise / association)</label>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
+              <div><label className="text-xs text-gray-500 block mb-1">Date d'adhésion *</label><input type="date" value={form.date_adhesion} onChange={e=>setForm(f=>({...f,date_adhesion:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
+
+              {!form.structure && <>
+                <div><label className="text-xs text-gray-500 block mb-1">Civilité *</label><select value={form.civilite} onChange={e=>setForm(f=>({...f,civilite:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"><option>Mme</option><option>M.</option></select></div>
+                <div><label className="text-xs text-gray-500 block mb-1">Prénom *</label><input maxLength={50} value={form.prenom} onChange={e=>setForm(f=>({...f,prenom:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
+              </>}
+
+              <div><label className="text-xs text-gray-500 block mb-1">NOM *</label><input maxLength={80} value={form.nom} onChange={e=>setForm(f=>({...f,nom:e.target.value.toUpperCase()}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm uppercase focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
+
+              {form.structure && <div><label className="text-xs text-gray-500 block mb-1">Contact (nom, prénom) *</label><input maxLength={80} value={form.contact_nom} onChange={e=>setForm(f=>({...f,contact_nom:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
+
+              {form.structure && <div className="col-span-2"><label className="text-xs text-gray-500 block mb-1">Adresse *</label><input maxLength={200} value={form.adresse} onChange={e=>setForm(f=>({...f,adresse:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Mail {form.structure?"*":"(facultatif)"}</label>
+                <input value={form.mail} onChange={e=>setForm(f=>({...f,mail:e.target.value}))} className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 ${!isValidEmail(form.mail)?"border-rose-300 focus:ring-rose-300":"border-gray-200 focus:ring-indigo-300"}`}/>
+                {!isValidEmail(form.mail) && <p className="text-xs text-rose-500 mt-0.5">Format mail invalide</p>}
+              </div>
+
+              <div><label className="text-xs text-gray-500 block mb-1">Téléphone *</label><input placeholder="06 12 34 56 78" value={form.telephone} onChange={e=>{setForm(f=>({...f,telephone:e.target.value}));setTelConfirm(false);}} className={`w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 ${!isValidTelFR(form.telephone)?"border-amber-300 focus:ring-amber-300":"border-gray-200 focus:ring-indigo-300"}`}/>
+                {!isValidTelFR(form.telephone) && <p className="text-xs text-amber-600 mt-0.5">⚠️ Ne ressemble pas à un numéro français — vérifiez la saisie (un numéro étranger reste accepté).</p>}</div>
+
+              {!form.structure && <div><label className="text-xs text-gray-500 block mb-1">Date de naissance *</label><input type="date" value={form.date_naissance} onChange={e=>setForm(f=>({...f,date_naissance:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
+
+              <div><label className="text-xs text-gray-500 block mb-1">Année d'adhésion *</label><input type="number" value={form.annee_adhesion} onChange={e=>setForm(f=>({...f,annee_adhesion:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
+
+              <div><label className="text-xs text-gray-500 block mb-1">Café *</label><select value={form.cafe} onChange={e=>setForm(f=>({...f,cafe:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">{cafes.map(c=><option key={c} value={c}>{c}</option>)}</select></div>
+
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Montant d'adhésion (€) *</label>
+                <input type="text" inputMode="decimal" value={form.montant} onChange={e=>{ const v=e.target.value; if(v===""||/^\d*[.,]?\d*$/.test(v)) setForm(f=>({...f,montant:v.replace(",",".")})); }} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/>
+              </div>
+
+              <div><label className="text-xs text-gray-500 block mb-1">Mode de règlement *</label><select value={form.mode_reglement} onChange={e=>setForm(f=>({...f,mode_reglement:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">{MODES_ADH.map(m=><option key={m}>{m}</option>)}</select></div>
+
+              {!form.structure && <div><label className="text-xs text-gray-500 block mb-1">Source d'arrivée</label><select value={form.source_arrivee} onChange={e=>setForm(f=>({...f,source_arrivee:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"><option value="">—</option>{SOURCES_ARRIVEE.map(s=><option key={s}>{s}</option>)}</select></div>}
+            </div>
+
+            <div className="flex flex-wrap gap-4 mb-4">
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer"><input type="checkbox" checked={form.adhesion_offerte} onChange={e=>setForm(f=>({...f,adhesion_offerte:e.target.checked}))} className="w-4 h-4 accent-emerald-500"/>🎁 Adhésion offerte (don &gt; 50€)</label>
+              <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer"><input type="checkbox" checked={form.renouvellement} onChange={e=>setForm(f=>({...f,renouvellement:e.target.checked}))} className="w-4 h-4 accent-indigo-500"/>🔄 Renouvellement</label>
+              {!form.structure && <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer"><input type="checkbox" checked={form.de_passage} onChange={e=>setForm(f=>({...f,de_passage:e.target.checked}))} className="w-4 h-4 accent-gray-500"/>🚶 De passage</label>}
+            </div>
+
+            {reseaux.length>0 && <div className="mb-4">
+              <label className="text-xs text-gray-500 block mb-1">Réseaux</label>
+              <div className="flex flex-wrap gap-2">
+                {reseaux.map(r=><label key={r.nom} className="flex items-center gap-1.5 bg-sky-50 border border-sky-200 px-3 py-1.5 rounded-full text-xs cursor-pointer"><input type="checkbox" checked={form.reseaux.includes(r.nom)} onChange={()=>setForm(f=>({...f,reseaux:toggleArr(f.reseaux,r.nom)}))} className="w-3.5 h-3.5 accent-sky-500"/>{r.nom}</label>)}
+              </div>
+            </div>}
+
+            {!form.structure && <div className="mb-4">
+              <label className="text-xs text-gray-500 block mb-2">Rôles additionnels</label>
+              <div className="space-y-2">
+                {ROLES_ADDITIONNELS.map(role=>{
+                  const active = form.roles_additionnels.find(r=>r.role===role);
+                  return (
+                    <div key={role} className="border border-gray-100 rounded-xl p-3">
+                      <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer mb-2"><input type="checkbox" checked={!!active} onChange={()=>toggleRole(role)} className="w-4 h-4 accent-violet-500"/>{role}</label>
+                      {active && <div className="grid grid-cols-3 gap-2 pl-6">
+                        <div><label className="text-xs text-gray-400 block mb-0.5">Date formation</label><input type="date" value={active.date_formation} onChange={e=>updRole(role,"date_formation",e.target.value)} className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
+                        <div><label className="text-xs text-gray-400 block mb-0.5">Date début</label><input type="date" value={active.date_debut} onChange={e=>updRole(role,"date_debut",e.target.value)} className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
+                        <div><label className="text-xs text-gray-400 block mb-0.5">Date fin</label><input type="date" value={active.date_fin} onChange={e=>updRole(role,"date_fin",e.target.value)} className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-violet-300"/></div>
+                      </div>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>}
+
+            {!form.structure && <div className="mb-4">
+              <label className="text-xs text-gray-500 block mb-1">Mes Talents <span className="text-gray-400">(facultatif)</span></label>
+              <textarea maxLength={200} rows={2} value={form.talents||""} onChange={e=>setForm(f=>({...f,talents:e.target.value}))} placeholder="Ex: bricolage, cuisine, musique…" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300"/>
+              <p className="text-xs text-gray-400 mt-0.5">{(form.talents||"").length}/200</p>
+            </div>}
+
+            <div className="flex gap-2">
+              <button onClick={submit} className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 rounded-xl text-sm font-semibold transition-colors">{editId?"✓ Enregistrer les modifications":"✅ Créer l'adhérent"}</button>
+              {editId && <button onClick={resetForm} className="text-sm text-gray-500 hover:text-gray-700 px-4">Annuler</button>}
             </div>
           </div>
 
-          {/* Formulaire */}
-          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
-            <h3 className="font-semibold text-gray-800 mb-4">Nouvelle saisie</h3>
-            <div className="mb-4">
-              <label className="text-xs text-gray-500 block mb-1">Semaine</label>
-              <select value={form.semaine} onChange={e=>setForm(f=>({...f,semaine:e.target.value}))}
-                className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
-                {WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}
-              </select>
+          {/* Liste des adhérents */}
+          <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <h4 className="font-semibold text-gray-700 text-sm">📋 Liste des adhérents ({filteredRows.length})</h4>
+              <div className="flex gap-2">
+                <button onClick={()=>{setFilters({});setSortCol(null);setSortDir("asc");}} className="text-xs text-gray-500 hover:text-gray-700 font-medium border border-gray-200 rounded-lg px-3 py-1.5">🗑️ Supprimer tous les filtres</button>
+                <button onClick={()=>resetForm()} className="text-xs text-indigo-600 hover:text-indigo-800 font-medium">+ Nouvel adhérent</button>
+              </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full text-sm mb-4">
-                <thead><tr className="bg-gray-50">
-                  <th className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">Type</th>
-                  {MODES_ADH.map(m=><th key={m} className="text-center px-2 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">{m}</th>)}
-                  <th className="text-right px-3 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">Total</th>
-                </tr></thead>
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-gray-50">{COLS.map(c=>(
+                    <th key={c.k} className={`text-left px-2 py-2 text-gray-500 uppercase tracking-wide font-semibold ${c.w} ${c.sortable?"cursor-pointer hover:text-indigo-600 select-none":""}`} onClick={()=>c.sortable&&toggleSort(c.k)}>
+                      {c.label}{c.sortable?sortIcon(c.k):""}
+                    </th>
+                  ))}<th className="px-2 py-2"></th></tr>
+                  <tr className="bg-white">
+                    {COLS.map(c=>(
+                      <td key={c.k} className="px-2 py-1">
+                        {c.type==="select"
+                          ? <select value={filters[c.k]||""} onChange={e=>setFilters(f=>({...f,[c.k]:e.target.value}))} className="w-full border border-gray-200 rounded px-1 py-1 text-xs"><option value="">Tous</option>{c.options.map(([v,lbl])=><option key={v} value={v}>{lbl}</option>)}</select>
+                          : c.k.startsWith("_role_")||c.k==="created_at" ? null
+                          : <input value={filters[c.k]||""} onChange={e=>setFilters(f=>({...f,[c.k]:e.target.value}))} placeholder="filtrer…" className="w-full border border-gray-200 rounded px-1.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-300"/>}
+                      </td>
+                    ))}
+                    <td></td>
+                  </tr>
+                </thead>
                 <tbody>
-                  {[["Individuelles","indiv"],["Structure","struc"]].map(([lbl,pfx])=>(
-                    <tr key={pfx} className="border-t border-gray-50">
-                      <td className="px-3 py-2 font-medium text-gray-700">{lbl}</td>
-                      {MODES_ADH.map(m=>(
-                        <td key={m} className="px-2 py-2">
-                          <input type="number" step="0.5" min="0" placeholder="0"
-                            value={form[`${pfx}_${m}`]}
-                            onChange={e=>setForm(f=>({...f,[`${pfx}_${m}`]:e.target.value}))}
-                            className="w-20 border border-gray-200 rounded-lg px-2 py-1.5 text-sm text-center focus:outline-none focus:ring-2 focus:ring-indigo-300"/>
-                        </td>
-                      ))}
-                      <td className="px-3 py-2 text-right font-bold text-indigo-700">
-                        {(pfx==="indiv"?totalIndiv:totalStruc).toFixed(2)} €
+                  {filteredRows.map(r=>{
+                    const ben = getRoleInfo(r,"Bénévole"), tal = getRoleInfo(r,"Talentueux"), tis = getRoleInfo(r,"Tisseur de lien");
+                    return (
+                    <tr key={r.id} className="border-t border-gray-50 hover:bg-gray-50">
+                      <td className="px-2 py-2">{r.date_adhesion}</td>
+                      <td className="px-2 py-2">{r.structure?"🏢 Structure":"👤 Indiv."}</td>
+                      <td className="px-2 py-2">{r.civilite}</td>
+                      <td className="px-2 py-2">{r.prenom}</td>
+                      <td className="px-2 py-2 font-medium">{r.nom?.toUpperCase()}</td>
+                      <td className="px-2 py-2">{r.contact_nom}</td>
+                      <td className="px-2 py-2 truncate max-w-32">{r.adresse}</td>
+                      <td className="px-2 py-2 truncate max-w-32">{r.mail}</td>
+                      <td className="px-2 py-2">{r.telephone}</td>
+                      <td className="px-2 py-2">{r.date_naissance}</td>
+                      <td className="px-2 py-2">{r.annee_adhesion}</td>
+                      <td className="px-2 py-2">{r.cafe}</td>
+                      <td className="px-2 py-2 font-semibold text-indigo-700">{(parseFloat(r.montant)||0).toFixed(2)}€</td>
+                      <td className="px-2 py-2">{r.mode_reglement}</td>
+                      <td className="px-2 py-2">{r.adhesion_offerte?"✓":""}</td>
+                      <td className="px-2 py-2">{r.renouvellement?"✓":""}</td>
+                      <td className="px-2 py-2 truncate max-w-28">{(r.reseaux||[]).join(", ")}</td>
+                      <td className="px-2 py-2">{r.de_passage?"✓":""}</td>
+                      <td className="px-2 py-2 truncate max-w-28">{r.source_arrivee}</td>
+                      <td className="px-2 py-2">{ben?`✓ ${ben.date_debut||""}`:""}</td>
+                      <td className="px-2 py-2">{tal?`✓ ${tal.date_debut||""}`:""}</td>
+                      <td className="px-2 py-2">{tis?`✓ ${tis.date_debut||""}`:""}</td>
+                      <td className="px-2 py-2 truncate max-w-32">{r.talents}</td>
+                      <td className="px-2 py-2">{r.created_at?r.created_at.slice(0,10).split("-").reverse().join("/"):""}</td>
+                      <td className="px-2 py-2 flex gap-1">
+                        <button onClick={()=>editRow(r)} className="text-indigo-400 hover:text-indigo-600">✏️</button>
+                        <button onClick={()=>delRow(r.id)} className="text-rose-400 hover:text-rose-600">✕</button>
                       </td>
                     </tr>
-                  ))}
-                  <tr className="border-t-2 border-gray-200 bg-gray-50">
-                    <td className="px-3 py-2 font-bold text-gray-800">TOTAL</td>
-                    {MODES_ADH.map(m=>{
-                      const v=(parseFloat(form[`indiv_${m}`])||0)+(parseFloat(form[`struc_${m}`])||0);
-                      return <td key={m} className="px-2 py-2 text-center font-semibold text-gray-700">{v>0?`${(v||0).toFixed(2)}€`:"—"}</td>;
-                    })}
-                    <td className="px-3 py-2 text-right font-bold text-indigo-800">{(totalIndiv+totalStruc).toFixed(2)} €</td>
-                  </tr>
+                  );})}
+                  {filteredRows.length===0 && <tr><td colSpan={COLS.length+1} className="text-center py-6 text-gray-400">Aucun adhérent ne correspond aux filtres.</td></tr>}
                 </tbody>
               </table>
             </div>
-            <button onClick={submit} className="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-2.5 rounded-xl text-sm font-semibold transition-colors">
-              ✅ Enregistrer
-            </button>
-          </div>
-
-          {/* Historique */}
-          <div className="overflow-x-auto rounded-xl border border-gray-100 shadow-sm">
-            <table className="w-full text-sm">
-              <thead><tr className="bg-gray-50">
-                {["Semaine","Indiv. total","Struc. total","Total","Suppr."].map((h,i)=><th key={i} className="text-left px-3 py-2 text-xs font-semibold text-gray-500 uppercase tracking-wide">{h}</th>)}
-              </tr></thead>
-              <tbody>
-                {rows.length===0
-                  ? <tr><td colSpan={5} className="text-center py-8 text-gray-400 text-sm">Aucune donnée</td></tr>
-                  : rows.map((r,i)=>(
-                    <tr key={i} className="border-t border-gray-50 hover:bg-gray-50">
-                      <td className="px-3 py-2 font-medium text-gray-700">{r.semaine}</td>
-                      <td className="px-3 py-2 text-indigo-600">{r.total_indiv?.toFixed(2)} €</td>
-                      <td className="px-3 py-2 text-indigo-600">{r.total_struc?.toFixed(2)} €</td>
-                      <td className="px-3 py-2 font-bold text-indigo-800">{r.total?.toFixed(2)} €</td>
-                      <td className="px-3 py-2"><button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button></td>
-                    </tr>
-                  ))
-                }
-              </tbody>
-            </table>
           </div>
         </div>
       );
     };
+
 
     /* ── SECTION COMPTE MONNAIE ── */
     const PIECES = [
@@ -2198,9 +2790,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
     /* ── MAIN APP ── */
     const TABS_BASE = [
-      {id:"dashboard",label:"📊 Dashboard"},{id:"caisseta",label:"🍺 Caisse TA"},{id:"tcam",label:"🏠 TCAM"},
+      {id:"dashboard",label:"📊 Dashboard"},{id:"caisseta",label:"🍸 Caisse TA"},{id:"tcam",label:"🏠 TCAM"},
       {id:"dons",label:"💝 Dons"},{id:"achats",label:"🛒 Achats"},{id:"privatisation",label:"🎉 Privat."},
-      {id:"carte",label:"🃏 Carte"},{id:"monnaie",label:"💰 Monnaie"},{id:"adhesion",label:"🤝 Adhésion"},
+      {id:"carte",label:"🃏 Carte"},{id:"monnaie",label:"💰 Monnaie"},{id:"adhesion",label:"💛 Adhésion"},
     ];
 
     function App() {
@@ -2252,24 +2844,19 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       // Indicateur de sauvegarde
       useEffect(()=>{
         const onStart = () => { setSaving(true); };
-        const onDone  = () => { setSaving(false); setSaveError(null); };
+        const onDone  = () => { setSaving(false); };
         const onError = (e) => {
           setSaving(false);
-          setSaveError("⚠️ ÉCHEC DE SAUVEGARDE — nouvelle tentative automatique en cours. NE FERMEZ PAS et NE RECHARGEZ PAS cette page tant que ce message reste affiché, sinon la donnée sera perdue.");
-        };
-        const onStuck = (e) => {
-          setSaving(false);
-          setSaveError("❌ SAUVEGARDE IMPOSSIBLE après plusieurs tentatives (café : " + e.detail.cafe + ", section : " + e.detail.section + "). Vérifiez votre connexion internet, puis ressaisissez cette donnée si nécessaire.");
+          setSaveError("💾 Sauvegarde en cours…");
+          setTimeout(()=>setSaveError(null), 5000);
         };
         window.addEventListener("daddy_save_start", onStart);
         window.addEventListener("daddy_save_done",  onDone);
         window.addEventListener("daddy_save_error", onError);
-        window.addEventListener("daddy_save_stuck", onStuck);
         return () => {
           window.removeEventListener("daddy_save_start", onStart);
           window.removeEventListener("daddy_save_done",  onDone);
           window.removeEventListener("daddy_save_error", onError);
-          window.removeEventListener("daddy_save_stuck", onStuck);
         };
       }, []);
 
@@ -2302,12 +2889,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         try {
           const r = {};
           await Promise.all(cafes.map(async c=>{
-            const [ct,tc,dn,ac,pv,adh,rc] = await Promise.all([
+            const [ct,tc,dn,ac,pv,adherents,rc] = await Promise.all([
               loadData(c,"caisseta"), loadData(c,"tcam"), loadData(c,"dons"),
-              loadData(c,"achats"), loadData(c,"privatisation"), loadData(c,"adhesion"),
+              loadData(c,"achats"), loadData(c,"privatisation"), loadData(c,"adherents"),
               loadData(c,"restocollective")
             ]);
-            r[c] = {caisseta:ct, tcam:tc, dons:dn, achats:ac, privatisation:pv, adhesion:adh, restocollective:rc};
+            const adh = deriveAdhesionAgg(adherents||[]);
+            r[c] = {caisseta:ct, tcam:tc, dons:dn, achats:ac, privatisation:pv, adhesion:adh, adherents, restocollective:rc};
           }));
           setAllCafesData(r);
           setAllCafesLoaded(true);
@@ -2354,7 +2942,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
       const forceRefreshCafe = () => {
         if (activeCafe) {
-          ["caisseta","tcam","dons","achats","privatisation","adhesion","restocollective","carte"]
+          ["caisseta","tcam","dons","achats","privatisation","adherents","restocollective","carte"]
             .forEach(s => invalidateCache(activeCafe, s));
         }
         setCafeRefreshTick(t=>t+1);
@@ -2451,7 +3039,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   :tab==="privatisation" ?<SectionPrivatisation cafe={activeCafe} refreshTick={cafeRefreshTick}/>
                   :tab==="carte"         ?<SectionCarte cafe={activeCafe} carte={carte} setCarte={setCarte}/>
                   :tab==="monnaie"       ?<SectionMonnaie cafe={activeCafe}/>
-                  :tab==="adhesion"      ?<SectionAdhesion cafe={activeCafe} refreshTick={cafeRefreshTick}/>
+                  :tab==="adhesion"      ?<SectionAdhesion cafe={activeCafe} refreshTick={cafeRefreshTick} cafes={cafes}/>
                   :tab==="restocollective"?<SectionRestoCollective cafe={activeCafe} carte={carte} refreshTick={cafeRefreshTick}/>
                   :null
                 }
