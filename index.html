@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.0.0 · Build du 22/06/2026 12:59 -->
+<!-- DaddyPay v4.0.1 · Build du 23/06/2026 12:54 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -94,8 +94,24 @@
     const CAFES_KEY   = "daddy_cafes_list";
     const INITIAL_CAFES = ["Autun","Croix-Rousse","La Madeleine","Caluire","Ste Foy lès Lyon","Douai","Clermont-Ferrand"];
 
-    const loadUsers    = () => { try { const r = localStorage.getItem(USERS_KEY);   return r ? JSON.parse(r) : DEFAULT_USERS; } catch { return DEFAULT_USERS; } };
-    const saveUsers    = (u) => { try { localStorage.setItem(USERS_KEY, JSON.stringify(u)); } catch {} };
+    // v4.0.1 : comptes centralisés dans Supabase (cafe="_config", section="users")
+    // pour qu'une réinitialisation de mot de passe se propage immédiatement à tous les postes.
+    // localStorage reste un fallback de secours si Supabase est temporairement inaccessible.
+    const loadUsersLocal = () => { try { const r = localStorage.getItem(USERS_KEY); return r ? JSON.parse(r) : DEFAULT_USERS; } catch { return DEFAULT_USERS; } };
+    const saveUsersLocal = (u) => { try { localStorage.setItem(USERS_KEY, JSON.stringify(u)); } catch {} };
+    // loadUsers() : tente Supabase d'abord (source de vérité), retombe sur le cache local sinon.
+    const loadUsers = async () => {
+      try {
+        const remote = await loadData("_config", "users", true);
+        if (remote && remote.length > 0) { saveUsersLocal(remote); return remote; }
+      } catch {}
+      return loadUsersLocal();
+    };
+    // saveUsers() : écrit sur Supabase (source de vérité, propagation immédiate) ET en local (fallback).
+    const saveUsers = async (u) => {
+      saveUsersLocal(u);
+      await saveData("_config", "users", u);
+    };
     const loadSession  = () => { try { const r = sessionStorage.getItem(SESSION_KEY); return r ? JSON.parse(r) : null; } catch { return null; } };
     const saveSession  = (s) => { try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch {} };
     const clearSession = () => { try { sessionStorage.removeItem(SESSION_KEY); } catch {} };
@@ -755,8 +771,11 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     /* ── LOGIN SCREEN ── */
     const LoginScreen = ({ onLogin }) => {
       const [login,setLogin]=useState(""); const [pwd,setPwd]=useState(""); const [err,setErr]=useState(""); const [show,setShow]=useState(false);
-      const submit = () => {
-        const users = loadUsers();
+      const [checking,setChecking]=useState(false);
+      const submit = async () => {
+        setChecking(true); setErr("");
+        const users = await loadUsers();
+        setChecking(false);
         const u = users.find(x => x.login===login.trim() && b64d(x.pwd)===pwd);
         if (u) { const s={login:u.login,role:u.role,cafe:u.cafe}; saveSession(s); onLogin(s); }
         else { setErr("Identifiant ou mot de passe incorrect."); setPwd(""); }
@@ -775,8 +794,8 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                 <div className="relative"><input type={show?"text":"password"} value={pwd} onChange={e=>setPwd(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="••••••••" className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-amber-400 pr-10"/>
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
-              <button onClick={submit} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">Se connecter</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.0.0 · Build du 22/06/2026 12:59</p>
+              <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.0.1 · Build du 23/06/2026 12:54</p>
             </div>
           </div>
         </div>
@@ -804,7 +823,9 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
 
     /* ── ADMIN PANEL ── */
     const AdminPanel = ({ cafes, onCafeCreated, supaStatus }) => {
-      const [users,setUsers]     = useState(loadUsers());
+      const [users,setUsers]     = useState(loadUsersLocal()); // affichage immédiat depuis le cache local, rafraîchi par Supabase ensuite
+      const [usersLoading,setUsersLoading] = useState(true);
+      useEffect(()=>{ loadUsers().then(u=>{ setUsers(u); setUsersLoading(false); }); },[]);
       const [editPwd,setEditPwd] = useState({});
       const [newCafe,setNewCafe] = useState({nom:"",login:"",pwd:""});
       const [ejsCfg,setEjsCfg]   = useState(loadEmailJSConfig());
@@ -843,20 +864,22 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
 
       const flash = (m,t="ok") => { setMsg(m); setMsgType(t); setTimeout(()=>setMsg(""),4000); };
 
-      const resetPwd = (login, newP) => {
+      const resetPwd = async (login, newP) => {
         if (!newP.trim()) return;
         const upd = users.map(u=>u.login===login?{...u,pwd:b64e(newP)}:u);
-        saveUsers(upd); setUsers(upd);
+        setUsers(upd);
+        await saveUsers(upd);
         setEditPwd(p=>{const n={...p};delete n[login];return n;});
-        flash(`✅ Mot de passe de « ${login} » mis à jour.`);
+        flash(`✅ Mot de passe de « ${login} » mis à jour — propagé immédiatement à tous les postes.`);
       };
 
-      const createCafe = () => {
+      const createCafe = async () => {
         if (!newCafe.nom.trim()||!newCafe.login.trim()||!newCafe.pwd.trim()) { flash("⚠️ Remplissez tous les champs.","err"); return; }
         if (users.find(u=>u.login===newCafe.login.trim())) { flash("⚠️ Ce login existe déjà.","err"); return; }
         if (cafes.includes(newCafe.nom.trim())) { flash("⚠️ Ce café existe déjà.","err"); return; }
         const newUser = { login:newCafe.login.trim(), pwd:b64e(newCafe.pwd), role:"cafe", cafe:newCafe.nom.trim() };
-        const updUsers = [...users, newUser]; saveUsers(updUsers); setUsers(updUsers);
+        const updUsers = [...users, newUser]; setUsers(updUsers);
+        await saveUsers(updUsers);
         const updCafes = [...cafes, newCafe.nom.trim()]; saveCafesList(updCafes); onCafeCreated(updCafes);
         flash(`✅ Café « ${newCafe.nom} » créé (login : ${newCafe.login}).`);
         setNewCafe({nom:"",login:"",pwd:""});
