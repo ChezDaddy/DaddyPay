@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.1.1 · Build du 06/07/2026 -->
+<!-- DaddyPay v4.1.2 · Build du 08/07/2026 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -840,7 +840,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.1.1 · Build du 06/07/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.1.2 · Build du 08/07/2026</p>
             </div>
           </div>
         </div>
@@ -2204,8 +2204,22 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     const Dashboard = ({ cafe, rcOn=false, refreshTick=0 }) => {
       const [allData,setAllData]=useState({caisseta:[],tcam:[],dons:[],achats:[],privatisation:[],adhesion:[],adherents:[],restocollective:[]}); const [loading,setLoading]=useState(true);
       const [ft,setFt]=useState("week"); const [sw,setSw]=useState(getCurrentWeekLabel); const [sm,setSm]=useState(new Date().getMonth()+1);
+      const anneesDisponiblesDash = [...new Set([
+        ...allData.caisseta.map(r=>r.date?.slice(0,4)),
+        ...allData.tcam.map(r=>r.date?.slice(0,4)),
+        ...allData.dons.map(r=>r.date?.slice(0,4)),
+        ...allData.achats.map(r=>r.date?.slice(0,4)),
+        ...allData.privatisation.map(r=>r.date_evenement?.slice(0,4)),
+        ...allData.restocollective.map(r=>r.date?.slice(0,4)),
+        ...allData.adhesion.map(r=>r.annee?String(r.annee):null),
+      ].filter(Boolean))].sort((a,b)=>b-a);
+      const [anneeDash,setAnneeDash]=useState("");
+      useEffect(()=>{ if(!anneeDash && anneesDisponiblesDash.length) setAnneeDash(String(anneesDisponiblesDash[0])); },[anneesDisponiblesDash.join(",")]);
       useEffect(()=>{ (async()=>{ setLoading(true); const [caisseta,tcam,dons,achats,privatisation,adherents,restocollective]=await Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons"),loadData(cafe,"achats"),loadData(cafe,"privatisation"),loadData(cafe,"adherents"),loadData(cafe,"restocollective")]); const adhesion=deriveAdhesionAgg(adherents||[]); setAllData({caisseta,tcam,dons,achats,privatisation,adhesion,adherents,restocollective}); setLoading(false); })(); },[cafe, refreshTick]);
-      const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
+      const fil=useCallback((arr)=>{
+        const parAnnee = anneeDash ? arr.filter(r=>{ const d = r.annee ? String(r.annee) : (r.date||r.date_evenement)?.slice(0,4); return d===anneeDash; }) : arr;
+        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw); if(ft==="month")return parAnnee.filter(r=>r.mois===sm); if(ft==="year")return parAnnee; return parAnnee;
+      },[ft,sw,sm,anneeDash]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
       const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation),fADH=fil(allData.adhesion),fRC=fil(allData.restocollective);
       const tTA=sum(fTA),tTCAM=sum(fTCAM,"montant"),tD=sum(fD,"montant"),tA=sum(fA,"montant"),tP=sum(fP,"montant_facture"),tADH=sum(fADH,"total"),tRC=sum(fRC,"prix_total");
@@ -2216,8 +2230,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       return (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex flex-wrap gap-3 items-center justify-between">
-            <div className="flex gap-2 flex-wrap">
-              {["week","month","all"].map(x=><button key={x} onClick={()=>setFt(x)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${ft===x?"bg-emerald-500 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>{x==="week"?"Semaine":x==="month"?"Mois":"Tout"}</button>)}
+            <div className="flex gap-2 flex-wrap items-center">
+              {anneesDisponiblesDash.length>0 && <select value={anneeDash} onChange={e=>setAnneeDash(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300">{anneesDisponiblesDash.map(a=><option key={a} value={a}>{a}</option>)}</select>}
+              {["week","month","year","all"].map(x=><button key={x} onClick={()=>setFt(x)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${ft===x?"bg-emerald-500 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>{x==="week"?"Semaine":x==="month"?"Mois":x==="year"?"Année":"Tout"}</button>)}
               {ft==="week"&&<select value={sw} onChange={e=>setSw(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300">{WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}</select>}
               {ft==="month"&&<select value={sm} onChange={e=>setSm(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300">{MONTHS.map((m,i)=><option key={i} value={i+1}>{m}</option>)}</select>}
             </div>
@@ -2362,7 +2377,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
           {/* ── SYNTHÈSE ADHÉRENTS ── */}
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
-            <div className="px-5 py-3 bg-gray-50 border-b border-gray-100"><h4 className="text-sm font-semibold text-gray-700">💛 Adhérents par mois 2026</h4></div>
+            <div className="px-5 py-3 bg-gray-50 border-b border-gray-100"><h4 className="text-sm font-semibold text-gray-700">💛 Adhérents par mois {anneeDash||"—"}</h4></div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead><tr className="bg-gray-50 border-b border-gray-100">
@@ -2372,7 +2387,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 </tr></thead>
                 <tbody>
                   {(()=>{
-                    const adherents = allData.adherents||[];
+                    const adherents = (allData.adherents||[]).filter(a=>!anneeDash || String(parseInt(a.annee_adhesion))===String(anneeDash));
                     const byMonthAdh = (arr, fn) => MONTHS.map((_,i)=>{ const mAdh=arr.filter(a=>getMonthForDate(a.date_adhesion)===i+1); return fn(mAdh); });
                     const indiv = adherents.filter(a=>!a.structure);
                     const struc = adherents.filter(a=>a.structure);
@@ -2559,7 +2574,24 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       // Fonctions utilitaires — définies EN PREMIER
       const n = v => (typeof v==="number" && isFinite(v)) ? v : 0;
       const safeArr = a => Array.isArray(a) ? a : [];
-      const fil=useCallback((arr)=>{ if(ft==="week")return arr.filter(r=>r.semaine===sw); if(ft==="month")return arr.filter(r=>r.mois===sm); return arr; },[ft,sw,sm]);
+      const anneesDisponiblesDash = [...new Set(cafes.flatMap(c=>{
+        const d = allCafesData[c]||{};
+        return [
+          ...safeArr(d.caisseta).map(r=>r.date?.slice(0,4)),
+          ...safeArr(d.tcam).map(r=>r.date?.slice(0,4)),
+          ...safeArr(d.dons).map(r=>r.date?.slice(0,4)),
+          ...safeArr(d.achats).map(r=>r.date?.slice(0,4)),
+          ...safeArr(d.privatisation).map(r=>r.date_evenement?.slice(0,4)),
+          ...safeArr(d.restocollective).map(r=>r.date?.slice(0,4)),
+          ...safeArr(d.adhesion).map(r=>r.annee?String(r.annee):null),
+        ];
+      }).filter(Boolean))].sort((a,b)=>b-a);
+      const [anneeDash,setAnneeDash]=useState("");
+      useEffect(()=>{ if(!anneeDash && anneesDisponiblesDash.length) setAnneeDash(String(anneesDisponiblesDash[0])); },[anneesDisponiblesDash.join(",")]);
+      const fil=useCallback((arr)=>{
+        const parAnnee = anneeDash ? safeArr(arr).filter(r=>{ const d = r.annee ? String(r.annee) : (r.date||r.date_evenement)?.slice(0,4); return d===anneeDash; }) : safeArr(arr);
+        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw); if(ft==="month")return parAnnee.filter(r=>r.mois===sm); return parAnnee;
+      },[ft,sw,sm,anneeDash]);
       const sum=(arr,k="prix_total")=>{ const r=safeArr(arr).reduce((s,r)=>s+(parseFloat(r[k])||0),0); return isFinite(r)?r:0; };
 
       // Guard : afficher spinner si données pas encore chargées — AVANT tout calcul
@@ -2606,8 +2638,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           {subTab==="admin"&&isAdmin?<AdminPanel cafes={cafes} onCafeCreated={onCafeCreated} supaStatus={supaStatus}/>:<>
             {/* filtres */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4 flex flex-wrap gap-3 items-center justify-between">
-              <div className="flex gap-2 flex-wrap">
-                {["week","month","all"].map(x=><button key={x} onClick={()=>setFt(x)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${ft===x?"bg-gray-800 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>{x==="week"?"Semaine":x==="month"?"Mois":"Tout"}</button>)}
+              <div className="flex gap-2 flex-wrap items-center">
+                {anneesDisponiblesDash.length>0 && <select value={anneeDash} onChange={e=>setAnneeDash(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300">{anneesDisponiblesDash.map(a=><option key={a} value={a}>{a}</option>)}</select>}
+                {["week","month","year","all"].map(x=><button key={x} onClick={()=>setFt(x)} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${ft===x?"bg-gray-800 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>{x==="week"?"Semaine":x==="month"?"Mois":x==="year"?"Année":"Tout"}</button>)}
                 {ft==="week"&&<select value={sw} onChange={e=>setSw(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300">{WEEKS_2026.map(w=><option key={w.label} value={w.label}>{w.label} ({w.start.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})} → {w.end.toLocaleDateString("fr-FR",{day:"2-digit",month:"short"})})</option>)}</select>}
                 {ft==="month"&&<select value={sm} onChange={e=>setSm(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-300">{MONTHS.map((m,i)=><option key={i} value={i+1}>{m}</option>)}</select>}
               </div>
@@ -2740,7 +2773,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             {/* ── SYNTHÈSE ADHÉRENTS — TOUS CAFÉS (regroupé par café) ── */}
             <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
               <div className="px-5 py-3 bg-gray-50 border-b border-gray-100 flex items-center justify-between flex-wrap gap-2">
-                <h4 className="text-sm font-semibold text-gray-700">💛 Adhérents par café et par mois 2026</h4>
+                <h4 className="text-sm font-semibold text-gray-700">💛 Adhérents par café et par mois {anneeDash||"—"}</h4>
                 <div className="flex gap-1.5">
                   {[["all","Tous"],["indiv","Individuelles"],["struc","Structures"]].map(([v,lbl])=>(
                     <button key={v} onClick={()=>setAdhFilter(v)} className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${adhFilter===v?"bg-violet-500 text-white":"bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>{lbl}</button>
@@ -2751,6 +2784,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 const moisSel = [...Array(12).keys()].map(i=>i+1);
                 const perCafeMonth = cafes.map(c=>{
                   let adherents = (allCafesData[c]||{}).adherents||[];
+                  adherents = adherents.filter(a=>!anneeDash || String(parseInt(a.annee_adhesion))===String(anneeDash));
                   if (adhFilter==="indiv") adherents = adherents.filter(a=>!a.structure);
                   if (adhFilter==="struc") adherents = adherents.filter(a=>a.structure);
                   const totalM   = moisSel.map(m=>adherents.filter(a=>getMonthForDate(a.date_adhesion)===m).length);
@@ -2838,7 +2872,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     /* ── SECTION ADHÉSION ── */
     const MODES_ADH = ["Espèces","CB","Chèque","Virement","Prélèvement"];
     const ROLES_ADDITIONNELS = ["Bénévole","Talentueux","Tisseur de lien"];
-    const SOURCES_ARRIVEE = ["flyer / magazine","en passant / vitrine","bouche à oreille","réseaux sociaux"];
+    const SOURCES_ARRIVEE = ["flyer / magazine","en passant / vitrine","bouche à oreille","réseaux sociaux","Daddy&Vous"];
 
     // Année d'adhésion par défaut : année en cours (jan-nov), année suivante en décembre
     const defaultAnneeAdhesion = () => { const d=new Date(); return d.getMonth()===11 ? d.getFullYear()+1 : d.getFullYear(); };
@@ -3029,16 +3063,18 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const bySemaine = {};
       adherents.forEach(a => {
         const sem = getWeekForDate(a.date_adhesion) || "";
-        if (!bySemaine[sem]) {
-          bySemaine[sem] = { semaine: sem, mois: getMonthForDate(a.date_adhesion), total: 0 };
-          MODES_ADH.forEach(m => { bySemaine[sem][`indiv_${m}`]=0; bySemaine[sem][`struc_${m}`]=0; });
+        const annee = parseInt((a.date_adhesion||"").slice(0,4)) || null;
+        const cle = `${annee}_${sem}`; // évite qu'une même semaine (S12) de deux années différentes ne fusionne
+        if (!bySemaine[cle]) {
+          bySemaine[cle] = { semaine: sem, mois: getMonthForDate(a.date_adhesion), annee, total: 0 };
+          MODES_ADH.forEach(m => { bySemaine[cle][`indiv_${m}`]=0; bySemaine[cle][`struc_${m}`]=0; });
         }
         const montant = parseFloat(a.montant) || 0;
         // Une adhésion offerte (don>50€) est exclue du total adhésions mais incluse dans le total "incluant offertes"
         if (!a.adhesion_offerte) {
           const pfx = a.structure ? "struc" : "indiv";
-          bySemaine[sem][`${pfx}_${a.mode_reglement}`] = (bySemaine[sem][`${pfx}_${a.mode_reglement}`]||0) + montant;
-          bySemaine[sem].total += montant;
+          bySemaine[cle][`${pfx}_${a.mode_reglement}`] = (bySemaine[cle][`${pfx}_${a.mode_reglement}`]||0) + montant;
+          bySemaine[cle].total += montant;
         }
       });
       return Object.values(bySemaine);
@@ -3055,10 +3091,12 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [editId,setEditId]=useState(null);
       const [reseaux,setReseaux]=useState([]);
       const [filters,setFilters]=useState({});
+      const [anneeFiltre,setAnneeFiltre]=useState("");
       const [sortCol,setSortCol]=useState(null);
       const [sortDir,setSortDir]=useState("asc"); // "asc" | "desc"
       const [dupAlert,setDupAlert]=useState(null); // { matches:[...], pendingForm }
       const [telConfirm,setTelConfirm]=useState(false); // true = utilisateur a confirmé un numéro non FR
+      const [anneeConfirm,setAnneeConfirm]=useState(false); // true = utilisateur a confirmé une année d'adhésion inhabituelle
       const [printDoc,setPrintDoc]=useState(null); // adhérent dont on affiche le justificatif d'adhésion/paiement
       const [entete,setEntete]=useState({}); // en-tête café (adresse, SIRET) — géré dans Administration
 
@@ -3077,7 +3115,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         return()=>window.removeEventListener("reseaux_updated",h);
       },[]);
 
-      const resetForm = () => { setForm({...mkAdherentForm(), cafe}); setEditId(null); setTelConfirm(false); };
+      const resetForm = () => { setForm({...mkAdherentForm(), cafe}); setEditId(null); setTelConfirm(false); setAnneeConfirm(false); };
 
       // ── Dédoublonnage ──
       const norm = (s) => (s||"").trim().toLowerCase();
@@ -3130,21 +3168,41 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         if (form.structure && !form.adresse.trim()) { alert("L'adresse est obligatoire pour une structure."); return; }
         if (form.structure && !isValidEmail(form.mail)) { alert("Le mail est obligatoire pour une structure."); return; }
 
-        if (form.telephone.trim() && !isValidTelFR(form.telephone) && !telConfirm) {
-          if (!window.confirm(`Le numéro "${form.telephone}" ne ressemble pas à un numéro français standard.\n\nConfirmez-vous cette saisie (par exemple un numéro étranger) ?`)) return;
+        // Date d'adhésion vide (ex: fiche dupliquée pour renouvellement) -> date du jour par défaut
+        let f = form;
+        if (!f.date_adhesion) { f = {...f, date_adhesion: new Date().toISOString().slice(0,10)}; setForm(f); }
+
+        // Cohérence année d'adhésion / date du jour : OK si on est dans l'année N, ou en décembre de l'année N-1 (adhésions par anticipation)
+        const today = new Date();
+        const anneeN = parseInt(f.annee_adhesion);
+        const anneeOk = today.getFullYear()===anneeN || (today.getFullYear()===anneeN-1 && today.getMonth()===11);
+        if (!anneeOk && !anneeConfirm) {
+          if (!window.confirm(`L'année d'adhésion sélectionnée (${anneeN}) est inhabituelle par rapport à la date du jour (${today.toLocaleDateString("fr-FR")}).\n\nConfirmez-vous cette saisie ?`)) return;
+          setAnneeConfirm(true);
+        }
+
+        if (f.telephone.trim() && !isValidTelFR(f.telephone) && !telConfirm) {
+          if (!window.confirm(`Le numéro "${f.telephone}" ne ressemble pas à un numéro français standard.\n\nConfirmez-vous cette saisie (par exemple un numéro étranger) ?`)) return;
           setTelConfirm(true);
         }
 
-        const dups = findDuplicates(form, rows);
+        const dups = findDuplicates(f, rows);
         if (dups.length > 0 && !dupAlert) {
-          setDupAlert({ matches: dups, pendingForm: form });
+          setDupAlert({ matches: dups, pendingForm: f });
           return;
         }
         setDupAlert(null);
-        await doSave(form, rows);
+        await doSave(f, rows);
       };
 
       const editRow = (r) => { setForm(r); setEditId(r.id); window.scrollTo({top:0,behavior:"smooth"}); };
+      const duplicateRow = (r) => {
+        if (isReadOnly) return;
+        const nextYear = (parseInt(r.annee_adhesion)||new Date().getFullYear()) + 1;
+        setForm({...r, id:null, annee_adhesion: nextYear, date_adhesion:"", renouvellement:true, created_at:null});
+        setEditId(null);
+        window.scrollTo({top:0,behavior:"smooth"});
+      };
       const delRow = async (id) => { if(isReadOnly)return; if(!window.confirm("Confirmez-vous la suppression de cette fiche adhérent ?"))return; const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"adherents",u); };
 
       const toggleArr = (arr, val) => arr.includes(val) ? arr.filter(x=>x!==val) : [...arr, val];
@@ -3160,7 +3218,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
       // ── Filtres sur toutes les colonnes ──
       const getRoleInfo = (r, roleName) => (r.roles_additionnels||[]).find(x=>x.role===roleName);
+      const anneesDisponiblesAdh = [...new Set(rows.map(r=>parseInt(r.annee_adhesion)).filter(Boolean))].sort((a,b)=>b-a);
+
       const filteredRows = rows.filter(r => {
+        if (anneeFiltre && parseInt(r.annee_adhesion)!==parseInt(anneeFiltre)) return false;
         return Object.entries(filters).every(([k,v]) => {
           if (!v) return true;
           if (k==="structure") return v==="oui" ? r.structure : !r.structure;
@@ -3340,7 +3401,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
               {!form.structure && <div><label className="text-xs text-gray-500 block mb-1">Date de naissance *</label><input type="date" value={form.date_naissance} onChange={e=>setForm(f=>({...f,date_naissance:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
 
-              <div><label className="text-xs text-gray-500 block mb-1">Année d'adhésion *</label><input type="number" value={form.annee_adhesion} onChange={e=>setForm(f=>({...f,annee_adhesion:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
+              <div><label className="text-xs text-gray-500 block mb-1">Année d'adhésion *</label><input type="number" value={form.annee_adhesion} onChange={e=>{setForm(f=>({...f,annee_adhesion:e.target.value}));setAnneeConfirm(false);}} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
 
               <div><label className="text-xs text-gray-500 block mb-1">Café *</label><select value={form.cafe} onChange={e=>setForm(f=>({...f,cafe:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">{cafes.map(c=><option key={c} value={c}>{c}</option>)}</select></div>
 
@@ -3406,20 +3467,26 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
               <h4 className="font-semibold text-gray-700 text-sm">📋 Liste des adhérents ({filteredRows.length})</h4>
-              <div className="flex gap-2">
-                <button onClick={()=>{setFilters({});setSortCol(null);setSortDir("asc");}} className="text-xs text-gray-500 hover:text-gray-700 font-medium border border-gray-200 rounded-lg px-3 py-1.5">🗑️ Supprimer tous les filtres</button>
+              <div className="flex gap-2 items-center flex-wrap">
+                <label className="text-xs text-gray-500">Année :</label>
+                <select value={anneeFiltre} onChange={e=>setAnneeFiltre(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-300">
+                  <option value="">Toutes</option>
+                  {anneesDisponiblesAdh.map(a=><option key={a} value={a}>{a}</option>)}
+                </select>
+                <button onClick={()=>{setFilters({});setAnneeFiltre("");setSortCol(null);setSortDir("asc");}} className="text-xs text-gray-500 hover:text-gray-700 font-medium border border-gray-200 rounded-lg px-3 py-1.5">🗑️ Supprimer tous les filtres</button>
                 <button onClick={()=>resetForm()} className="text-xs text-indigo-600 hover:text-indigo-800 font-medium">+ Nouvel adhérent</button>
               </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
-                  <tr className="bg-gray-50">{COLS.map(c=>(
+                  <tr className="bg-gray-50"><th className="px-2 py-2"></th>{COLS.map(c=>(
                     <th key={c.k} className={`text-left px-2 py-2 text-gray-500 uppercase tracking-wide font-semibold ${c.w} ${c.sortable?"cursor-pointer hover:text-indigo-600 select-none":""}`} onClick={()=>c.sortable&&toggleSort(c.k)}>
                       {c.label}{c.sortable?sortIcon(c.k):""}
                     </th>
-                  ))}<th className="px-2 py-2"></th></tr>
+                  ))}</tr>
                   <tr className="bg-white">
+                    <td></td>
                     {COLS.map(c=>(
                       <td key={c.k} className="px-2 py-1">
                         {c.type==="select"
@@ -3428,7 +3495,6 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                           : <input value={filters[c.k]||""} onChange={e=>setFilters(f=>({...f,[c.k]:e.target.value}))} placeholder="filtrer…" className="w-full border border-gray-200 rounded px-1.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-300"/>}
                       </td>
                     ))}
-                    <td></td>
                   </tr>
                 </thead>
                 <tbody>
@@ -3436,6 +3502,12 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                     const ben = getRoleInfo(r,"Bénévole"), tal = getRoleInfo(r,"Talentueux"), tis = getRoleInfo(r,"Tisseur de lien");
                     return (
                     <tr key={r.id} className="border-t border-gray-50 hover:bg-gray-50">
+                      <td className="px-2 py-2 flex gap-1">
+                        {!isReadOnly && <button onClick={()=>editRow(r)} className="text-indigo-400 hover:text-indigo-600" title="Modifier">✏️</button>}
+                        {!isReadOnly && <button onClick={()=>delRow(r.id)} className="text-rose-400 hover:text-rose-600" title="Supprimer">✕</button>}
+                        {!isReadOnly && <button onClick={()=>duplicateRow(r)} className="text-emerald-500 hover:text-emerald-700" title="Dupliquer (renouvellement année suivante)">📋</button>}
+                        {r.structure && <button onClick={()=>setPrintDoc(r)} className="text-gray-400 hover:text-gray-600" title="Imprimer le justificatif">🖨️</button>}
+                      </td>
                       <td className="px-2 py-2">{r.date_adhesion}</td>
                       <td className="px-2 py-2">{r.structure?"🏢 Structure":"👤 Indiv."}</td>
                       <td className="px-2 py-2">{r.civilite}</td>
@@ -3463,11 +3535,6 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                       <td className="px-2 py-2 truncate max-w-32 text-amber-700">{(r.interets||[]).join(", ")}</td>
                       <td className="px-2 py-2 truncate max-w-32">{r.talents}</td>
                       <td className="px-2 py-2">{r.created_at?r.created_at.slice(0,10).split("-").reverse().join("/"):""}</td>
-                      <td className="px-2 py-2 flex gap-1">
-                        {!isReadOnly && <button onClick={()=>editRow(r)} className="text-indigo-400 hover:text-indigo-600">✏️</button>}
-                        {!isReadOnly && <button onClick={()=>delRow(r.id)} className="text-rose-400 hover:text-rose-600">✕</button>}
-                        {r.structure && <button onClick={()=>setPrintDoc(r)} className="text-gray-400 hover:text-gray-600" title="Imprimer le justificatif">🖨️</button>}
-                      </td>
                     </tr>
                   );})}
                   {filteredRows.length===0 && <tr><td colSpan={COLS.length+1} className="text-center py-6 text-gray-400">Aucun adhérent ne correspond aux filtres.</td></tr>}
