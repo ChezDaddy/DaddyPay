@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.1.2 · Build du 08/07/2026 -->
+<!-- DaddyPay v4.1.3 · Build du 16/07/2026 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -141,6 +141,17 @@
     const clearSession = () => { try { sessionStorage.removeItem(SESSION_KEY); } catch {} };
     const loadCafesList = () => { try { const r = localStorage.getItem(CAFES_KEY); return r ? JSON.parse(r) : INITIAL_CAFES; } catch { return INITIAL_CAFES; } };
     const saveCafesList = (l) => { try { localStorage.setItem(CAFES_KEY, JSON.stringify(l)); } catch {} };
+    // Source de vérité partagée (Supabase _config/cafes) — indispensable pour que tous les comptes
+    // (Opérations, Directeur, Admin), sur n'importe quel poste, voient les mêmes cafés, y compris
+    // ceux créés après coup. Le localStorage ne sert plus que de cache de secours hors-ligne.
+    const loadCafesListRemote = async () => {
+      try {
+        const remote = await loadData("_config", "cafes", true);
+        if (remote && remote.length > 0) { saveCafesList(remote); return remote; }
+      } catch {}
+      return loadCafesList();
+    };
+    const saveCafesListRemote = async (l) => { saveCafesList(l); await saveData("_config", "cafes", l); };
 
     /* ── RESTAURATION COLLECTIVE — activation par café ── */
     const RC_KEY = "daddy_rc_enabled";
@@ -533,19 +544,37 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       const key = cafe + ":" + section;
       // Utiliser le cache mémoire sauf si on veut forcer un rechargement
       if (!bypassCache && _memCache.has(key)) return _memCache.get(key);
+      const lsKey = _lsKey(cafe,section);
       try {
         const rows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data,updated_at&order=updated_at.desc&limit=1`);
         if (rows !== null) {
           const v = (Array.isArray(rows) && rows.length > 0 && rows[0].data != null) ? rows[0].data : [];
+          // Garde-fou anti-perte de données : si le serveur renvoie un résultat VIDE alors qu'on a
+          // déjà des données NON vides en cache local (ex: Supabase pas encore réveillé après une
+          // pause de projet), on se méfie et on garde les données locales plutôt que d'écraser
+          // silencieusement le cache — et surtout, on ne persiste jamais ce vide suspect.
+          if (v.length === 0) {
+            const fb = localStorage.getItem(lsKey);
+            if (fb) {
+              try {
+                const parsed = JSON.parse(fb);
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                  console.warn(`loadData: résultat vide suspect pour ${key}, conservation du cache local (${parsed.length} lignes).`);
+                  _memCache.set(key, parsed);
+                  return parsed;
+                }
+              } catch {}
+            }
+          }
           _memCache.set(key, v);
-          try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(v)); } catch{}
+          try { localStorage.setItem(lsKey, JSON.stringify(v)); } catch{}
           return v;
         }
         // Supabase KO → fallback localStorage
-        const fb = localStorage.getItem(_lsKey(cafe,section));
+        const fb = localStorage.getItem(lsKey);
         return fb ? JSON.parse(fb) : [];
       } catch {
-        const fb = localStorage.getItem(_lsKey(cafe,section));
+        const fb = localStorage.getItem(lsKey);
         return fb ? JSON.parse(fb) : [];
       }
     };
@@ -840,7 +869,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.1.2 · Build du 08/07/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.1.3 · Build du 16/07/2026</p>
             </div>
           </div>
         </div>
@@ -936,7 +965,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
         const newUser = { login:newCafe.login.trim(), pwd:b64e(newCafe.pwd), role:"cafe", cafe:newCafe.nom.trim() };
         const updUsers = [...users, newUser]; setUsers(updUsers);
         await saveUsers(updUsers);
-        const updCafes = [...cafes, newCafe.nom.trim()]; saveCafesList(updCafes); onCafeCreated(updCafes);
+        const updCafes = [...cafes, newCafe.nom.trim()]; await saveCafesListRemote(updCafes); onCafeCreated(updCafes);
         flash(`✅ Café « ${newCafe.nom} » créé (login : ${newCafe.login}).`);
         setNewCafe({nom:"",login:"",pwd:""});
       };
@@ -3063,7 +3092,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const bySemaine = {};
       adherents.forEach(a => {
         const sem = getWeekForDate(a.date_adhesion) || "";
-        const annee = parseInt((a.date_adhesion||"").slice(0,4)) || null;
+        const annee = parseInt(a.annee_adhesion) || parseInt((a.date_adhesion||"").slice(0,4)) || null;
         const cle = `${annee}_${sem}`; // évite qu'une même semaine (S12) de deux années différentes ne fusionne
         if (!bySemaine[cle]) {
           bySemaine[cle] = { semaine: sem, mois: getMonthForDate(a.date_adhesion), annee, total: 0 };
@@ -3853,6 +3882,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
     function App() {
       const [session,setSession]     = useState(()=>loadSession());
       const [cafes,setCafes]         = useState(()=>loadCafesList());
+      // Vue globale (Opérations/Directeur/Admin) : la liste des cafés doit toujours refléter
+      // Supabase, pas seulement le cache local du poste — sinon un café créé ailleurs reste invisible.
+      useEffect(()=>{ loadCafesListRemote().then(setCafes); },[]);
       const [tab,setTab]             = useState("dashboard");
       const [selCafe,setSelCafe]     = useState(null);
       const [carte,setCarte]         = useState(DEFAULT_CARTE);
