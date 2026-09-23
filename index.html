@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.2.0 · Build du 21/09/2026 -->
+<!-- DaddyPay v4.2.1 · Build du 23/09/2026 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -62,67 +62,15 @@
       }
     };
 
-    /* File d'attente pour les sauvegardes ratées — retry en arrière-plan.
-       v4.2.0 : persistée dans localStorage pour survivre à une fermeture/rechargement
-       d'onglet pendant qu'une sauvegarde est en attente de reprise (cf. incident
-       Croix-Rousse du 17/09/2026 : ventes saisies le soir, jamais transmises à Supabase
-       car la file de reprise n'existait qu'en mémoire et l'onglet a été fermé avant
-       que la reconnexion réussisse — la vente restait invisible pour tout autre appareil). */
-    const _PENDING_KEY = "daddy_pending_saves";
-    const _saveQueue = [];
-    let _saveRunning = false;
-
-    const _persistQueue = () => {
-      try {
-        // resolve n'est pas sérialisable (fonction) : on ne persiste que les données utiles
-        const serializable = _saveQueue.map(({cafe, section, data}) => ({cafe, section, data}));
-        localStorage.setItem(_PENDING_KEY, JSON.stringify(serializable));
-      } catch (e) {
-        console.error("_persistQueue: écriture localStorage impossible", e.message);
-        window.dispatchEvent(new CustomEvent("daddy_localstorage_error", { detail: { context: "queue", message: e.message } }));
-      }
-    };
-
-    // Au chargement de l'app : reprendre toute sauvegarde restée en attente d'une session précédente
-    // (onglet fermé/rechargé/planté avant la fin de la reprise réseau).
-    (() => {
-      try {
-        const raw = localStorage.getItem(_PENDING_KEY);
-        if (!raw) return;
-        const pending = JSON.parse(raw);
-        if (Array.isArray(pending) && pending.length > 0) {
-          console.warn(`Reprise de ${pending.length} sauvegarde(s) en attente depuis une session précédente.`);
-          pending.forEach(({cafe, section, data}) => _saveQueue.push({cafe, section, data, resolve: ()=>{}}));
-        }
-      } catch (e) {
-        console.error("Lecture de la file de reprise impossible :", e.message);
-      }
-    })();
-
-    const _flushQueue = async () => {
-      if (_saveRunning || _saveQueue.length===0) return;
-      _saveRunning = true;
-      window.dispatchEvent(new CustomEvent("daddy_queue_pending", { detail: { count: _saveQueue.length } }));
-      while (_saveQueue.length > 0) {
-        const {cafe, section, data, resolve} = _saveQueue[0];
-        const res = await supaFetch("/rest/v1/daddy_data", {
-          method: "POST",
-          headers: { "Prefer": "resolution=merge-duplicates,return=minimal" },
-          body: JSON.stringify({ cafe, section, data, updated_at: new Date().toISOString() })
-        });
-        if (res !== null) {
-          _saveQueue.shift();
-          _persistQueue();
-          resolve(true);
-        } else {
-          // Réessayer dans 5s
-          await new Promise(r=>setTimeout(r,5000));
-        }
-      }
-      _saveRunning = false;
-      window.dispatchEvent(new CustomEvent("daddy_queue_flushed"));
-    };
-    _flushQueue(); // reprise immédiate si des sauvegardes attendaient depuis avant ce chargement
+    /* v4.2.1 : la file d'attente de reprise automatique (testée puis abandonnée en cours
+       de mise au point) n'a pas été retenue. Elle ajoutait un flux masqué entre le local et Supabase,
+       contraire au fonctionnement voulu (deux flux indépendants ; en cas de problème,
+       comparaison et copie MANUELLE via 🛟 Récupération d'urgence — jamais d'automatisme
+       qui rejoue les sauvegardes en arrière-plan). Un échec de sauvegarde reste désormais
+       ce qu'il a toujours été : les données restent sûres en local (mémoire + localStorage,
+       voir saveData), l'échec est journalisé et signalé une fois à l'écran, et c'est
+       🛟 Récupération d'urgence qui sert de filet de sécurité si besoin — pas une boucle
+       qui rejoue toute seule et peut se bloquer. */
 
     /* ── AUTH ── */
     const b64e = (s) => btoa(unescape(encodeURIComponent(s)));
@@ -591,6 +539,19 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
         const rows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data,updated_at&order=updated_at.desc&limit=1`);
         if (rows !== null) {
           const v = (Array.isArray(rows) && rows.length > 0 && rows[0].data != null) ? rows[0].data : [];
+          // Garde-fou anti-course : si une sauvegarde est EN COURS pour cette même clé
+          // (DELETE+INSERT pas encore terminé, cf. saveData), cette lecture réseau peut
+          // renvoyer un état intermédiaire ou pré-sauvegarde. On ne l'utilise surtout pas
+          // pour écraser le cache/localStorage — la source la plus fraîche reste celle que
+          // saveData vient d'écrire localement.
+          if (_saveLocks.has(key)) {
+            console.warn(`loadData: sauvegarde en cours pour ${key}, lecture réseau ignorée pour ne pas écraser le local.`);
+            if (_memCache.has(key)) return _memCache.get(key);
+            const fbRace = localStorage.getItem(lsKey);
+            if (fbRace) { try { const p = JSON.parse(fbRace); if (Array.isArray(p)) return p; } catch {} }
+            // Rien de local à opposer : on retourne quand même la lecture réseau, sans la persister.
+            return v;
+          }
           // Garde-fou anti-perte de données : si le serveur renvoie un résultat VIDE alors qu'on a
           // déjà des données NON vides en cache local (ex: Supabase pas encore réveillé après une
           // pause de projet), on se méfie et on garde les données locales plutôt que d'écraser
@@ -622,6 +583,17 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       }
     };
 
+    // Lecture Supabase strictement en lecture — ne touche JAMAIS _memCache ni localStorage.
+    // Utilisée pour comparer le serveur au backup local (🛟 Récupération d'urgence) sans jamais
+    // risquer d'écraser ce backup avec un état serveur qui se révélerait moins bon (le simple fait
+    // de consulter/comparer ne doit jamais pouvoir modifier le local).
+    const peekServerData = async (cafe, section) => {
+      try {
+        const rows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data,updated_at&order=updated_at.desc&limit=1`);
+        if (!Array.isArray(rows) || rows.length === 0 || rows[0].data == null) return [];
+        return Array.isArray(rows[0].data) ? rows[0].data : [];
+      } catch { return null; } // null = lecture impossible (à distinguer d'un [] serveur réellement vide)
+    };
     // Mutex par clé (cafe:section) — empêche les DELETE+INSERT entrelacés
     const _saveLocks  = new Map(); // clé → Promise en cours
     const _savePending = new Map(); // clé → dernière data en attente
@@ -653,11 +625,89 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       } catch { return null; } // échec réseau → on ne bloque pas une sauvegarde légitime (fail-open)
     };
 
-    const saveData = async (cafe, section, data) => {
+    // Fusion ligne à ligne par id (v4.2.1) — remplace le remplacement complet du tableau.
+    // Nécessaire dès que 2 postes sont ouverts simultanément sur le même café (cas courant,
+    // demande initiale) : sans ça, le poste A qui enregistre après le poste B écrase silencieusement
+    // tout ce que B a ajouté/modifié entre le chargement de A et l'enregistrement de A.
+    // Principe : pour chaque ligne déjà côté serveur, on garde la version LOCALE si cette session
+    // la possède encore (elle vient peut-être de la modifier) ; si cette session ne l'a plus MAIS
+    // ne l'avait jamais eue (= "baseline", le dernier état chargé par cette session), c'est que
+    // l'AUTRE poste l'a ajoutée depuis notre dernier chargement → on la garde. Si cette session ne
+    // l'a plus ET l'avait dans sa baseline → suppression volontaire de notre part → on l'omet.
+    // Enfin on ajoute les lignes purement locales pas encore côté serveur (nouvelles saisies).
+    const _mergeRowsForSave = (localData, serverData, baseline) => {
+      const hasId = (r) => r && r.id !== undefined && r.id !== null;
+      if (!Array.isArray(localData) || !Array.isArray(serverData)) return localData;
+      // Pas d'id fiable sur toutes les lignes → fusion impossible, comportement historique (remplacement complet)
+      if (!localData.every(hasId) || !serverData.every(hasId)) return localData;
+      const baselineIds = new Set((Array.isArray(baseline) ? baseline : []).filter(hasId).map(r => r.id));
+      const localById = new Map(localData.map(r => [r.id, r]));
+      const merged = [];
+      const seen = new Set();
+      for (const srow of serverData) {
+        if (localById.has(srow.id)) {
+          merged.push(localById.get(srow.id));
+        } else if (!baselineIds.has(srow.id)) {
+          merged.push(srow); // ajoutée/modifiée par un AUTRE poste depuis notre dernier chargement
+        }
+        // sinon : on l'avait (baseline) et on ne l'a plus (local) → suppression volontaire, on l'omet
+        seen.add(srow.id);
+      }
+      for (const lrow of localData) {
+        if (!seen.has(lrow.id)) merged.push(lrow); // nouvelle ligne locale, pas encore côté serveur
+      }
+      return merged;
+    };
+
+    const saveData = async (cafe, section, data, opts={}) => {
       if (_currentRole === "directeur") {
         console.warn("Écriture bloquée : rôle Directeur (lecture seule).", cafe, section);
         window.dispatchEvent(new CustomEvent("daddy_readonly_block"));
         return false;
+      }
+
+      // Mode dédié à 🛟 Récupération d'urgence (v4.2.1) : remonte du localStorage vers Supabase
+      // UNIQUEMENT les lignes absentes côté serveur (comparaison par id). Ne modifie et ne
+      // supprime JAMAIS une ligne déjà présente côté serveur, même si le backup local en a
+      // une version différente — contrairement à saveData normal, qui privilégie la version
+      // locale pour les id qu'il connaît. Ici le serveur est toujours prioritaire pour ce qu'il a déjà.
+      if (opts.missingOnly) {
+        window.dispatchEvent(new CustomEvent("daddy_save_start"));
+        try {
+          const freshRows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data&order=updated_at.desc&limit=1`);
+          const serverData = (Array.isArray(freshRows) && freshRows.length > 0 && Array.isArray(freshRows[0].data)) ? freshRows[0].data : [];
+          const hasId = (r) => r && r.id !== undefined && r.id !== null;
+          if (!Array.isArray(data) || !data.every(hasId) || !serverData.every(hasId)) {
+            window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
+            return { ok:false, added:0, reason:"id absent ou peu fiable sur au moins une ligne — fusion impossible en sécurité" };
+          }
+          const serverIds = new Set(serverData.map(r=>r.id));
+          const missing = data.filter(r => !serverIds.has(r.id));
+          if (missing.length === 0) {
+            window.dispatchEvent(new CustomEvent("daddy_save_done"));
+            return { ok:true, added:0 };
+          }
+          const finalData = [...serverData, ...missing];
+          await supaFetch(
+            `/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}`,
+            { method: "DELETE", headers: { "Prefer": "return=minimal" } }
+          );
+          const res = await supaFetch("/rest/v1/daddy_data", {
+            method: "POST",
+            headers: { "Prefer": "return=minimal" },
+            body: JSON.stringify({ cafe, section, data: finalData, updated_at: new Date().toISOString() })
+          });
+          if (res === null) throw new Error("INSERT failed");
+          const key = cafe + ":" + section;
+          _memCache.set(key, finalData);
+          try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(finalData)); } catch {}
+          window.dispatchEvent(new CustomEvent("daddy_save_done"));
+          return { ok:true, added: missing.length };
+        } catch(e) {
+          console.error("saveData(missingOnly) error:", cafe, section, e.message);
+          window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
+          return { ok:false, added:0, reason:e.message };
+        }
       }
 
       const drop = await checkSuspiciousDrop(cafe, section, data);
@@ -672,6 +722,9 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       }
 
       const key = cafe + ":" + section;
+      // Dernier état connu par CETTE session (avant qu'on l'écrase juste après) — sert de
+      // référence pour distinguer une suppression volontaire d'un ajout fait par un autre poste.
+      const baseline = _memCache.get(key);
 
       // 1. Cache mémoire immédiat
       _memCache.set(key, data);
@@ -688,9 +741,19 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       }
 
       // 4. Acquérir le verrou et sauvegarder
-      const doSave = async (dataToSave) => {
+      const doSave = async (dataToSave, baselineForMerge) => {
         window.dispatchEvent(new CustomEvent("daddy_save_start"));
         try {
+          // Lecture fraîche du serveur juste avant d'écrire, pour fusionner ligne à ligne
+          // plutôt que d'écraser tout le tableau (v4.2.1 — 2 postes simultanés au même café).
+          let mergedData = dataToSave;
+          try {
+            const freshRows = await supaFetch(`/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}&select=data&order=updated_at.desc&limit=1`);
+            if (Array.isArray(freshRows) && freshRows.length > 0 && Array.isArray(freshRows[0].data)) {
+              mergedData = _mergeRowsForSave(dataToSave, freshRows[0].data, baselineForMerge);
+            }
+          } catch { /* lecture de fusion impossible → on écrit dataToSave tel quel, comportement historique */ }
+
           await supaFetch(
             `/rest/v1/daddy_data?cafe=eq.${encodeURIComponent(cafe)}&section=eq.${encodeURIComponent(section)}`,
             { method: "DELETE", headers: { "Prefer": "return=minimal" } }
@@ -698,29 +761,36 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
           const res = await supaFetch("/rest/v1/daddy_data", {
             method: "POST",
             headers: { "Prefer": "return=minimal" },
-            body: JSON.stringify({ cafe, section, data: dataToSave, updated_at: new Date().toISOString() })
+            body: JSON.stringify({ cafe, section, data: mergedData, updated_at: new Date().toISOString() })
           });
           if (res === null) throw new Error("INSERT failed");
+
+          // Le résultat fusionné peut contenir des lignes ajoutées par un AUTRE poste : on met à
+          // jour le cache local de CETTE session avec, pour qu'elle les voie aussi immédiatement.
+          _memCache.set(key, mergedData);
+          try { localStorage.setItem(_lsKey(cafe,section), JSON.stringify(mergedData)); } catch {}
+
           window.dispatchEvent(new CustomEvent("daddy_save_done"));
 
-          // Si une valeur plus récente est arrivée pendant qu'on sauvegardait → la sauvegarder aussi
+          // Si une valeur plus récente est arrivée pendant qu'on sauvegardait → la sauvegarder aussi,
+          // en repartant de l'état qu'on vient d'écrire comme nouvelle référence de fusion.
           if (_savePending.has(key)) {
             const next = _savePending.get(key);
             _savePending.delete(key);
-            await doSave(next);
+            await doSave(next, mergedData);
           }
           return true;
         } catch(e) {
           console.error("saveData error:", cafe, section, e.message);
-          _saveQueue.push({cafe, section, data: dataToSave, resolve: ()=>{}});
-          _persistQueue();
-          _flushQueue();
+          // v4.2.1 : pas de file de reprise automatique — les données restent sûres en
+          // local (mémoire + localStorage, étapes 1-2 ci-dessus) ; c'est 🛟 Récupération
+          // d'urgence qui sert de filet de sécurité manuel si besoin.
           window.dispatchEvent(new CustomEvent("daddy_save_error", { detail: { cafe, section } }));
           return false;
         }
       };
 
-      const lock = doSave(data).finally(() => { _saveLocks.delete(key); });
+      const lock = doSave(data, baseline).finally(() => { _saveLocks.delete(key); });
       _saveLocks.set(key, lock);
       return lock;
     };
@@ -950,7 +1020,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.2.0 · Build du 21/09/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.2.1 · Build du 23/09/2026</p>
             </div>
           </div>
         </div>
@@ -1426,8 +1496,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 const lsRaw = localStorage.getItem(`daddy_fb_${recupCafe}_${recupSection}`);
                 const lsData = lsRaw ? JSON.parse(lsRaw) : [];
                 setRecupData(lsData);
-                // Lire Supabase
-                const supaRows = await loadData(recupCafe, recupSection, true);
+                // Lire Supabase (lecture pure, ne modifie jamais le local — cf. peekServerData)
+                const supaRows = await peekServerData(recupCafe, recupSection);
                 setRecupSupa(supaRows);
                 setRecupMsg("");
               }} className="bg-amber-500 hover:bg-amber-600 disabled:opacity-40 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
@@ -1451,10 +1521,15 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                 </div>
               </div>
 
-              {recupData.length > (recupSupa?.length||0) &&
+              {recupSupa!==null && recupData.length > (recupSupa?.length||0) &&
                 <div className="bg-rose-50 border border-rose-200 rounded-xl p-3 mb-3">
                   <p className="text-sm font-semibold text-rose-700 mb-1">⚠️ Le backup local contient plus de données que Supabase !</p>
                   <p className="text-xs text-gray-600">Local : {recupData.length} lignes — Supabase : {recupSupa?.length||0} lignes. Une restauration est probablement nécessaire.</p>
+                </div>}
+
+              {!recupMsg && recupSupa===null &&
+                <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 mb-3">
+                  <p className="text-sm text-gray-600">⚠️ Lecture de Supabase impossible (réseau) — comparaison non fiable pour l'instant. Réessayez.</p>
                 </div>}
 
               {recupData.length === 0 &&
@@ -1489,13 +1564,19 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                     📥 Exporter en CSV
                   </button>
                   <button onClick={async()=>{
-                    if(!window.confirm(`Restaurer ${recupData.length} ligne(s) dans Supabase pour ${recupCafe} / ${recupSection} ?\n\nCela écrasera les données actuelles de Supabase.`)) return;
-                    setRecupMsg("Restauration en cours…");
-                    const ok = await saveData(recupCafe, recupSection, recupData);
-                    setRecupMsg(ok ? `✅ ${recupData.length} ligne(s) restaurée(s) avec succès dans Supabase.` : "❌ Erreur lors de la restauration — réessayez.");
-                    if(ok) { const s=await loadData(recupCafe,recupSection,true); setRecupSupa(s); }
+                    if(!window.confirm(`Comparer et ajouter les lignes manquantes dans Supabase pour ${recupCafe} / ${recupSection} ?\n\nSeules les lignes du backup local ABSENTES de Supabase (par id) seront ajoutées. Aucune ligne déjà présente côté serveur ne sera modifiée ni supprimée.`)) return;
+                    setRecupMsg("Comparaison et ajout en cours…");
+                    const result = await saveData(recupCafe, recupSection, recupData, {missingOnly:true});
+                    if (!result.ok) {
+                      setRecupMsg(`❌ Restauration impossible${result.reason ? " : "+result.reason : ""} — réessayez.`);
+                    } else if (result.added === 0) {
+                      setRecupMsg("ℹ️ Rien à ajouter : toutes les lignes du backup local sont déjà présentes côté serveur.");
+                    } else {
+                      setRecupMsg(`✅ ${result.added} ligne(s) manquante(s) ajoutée(s) avec succès dans Supabase (lignes déjà présentes non modifiées).`);
+                    }
+                    if (result.ok) { const s=await peekServerData(recupCafe,recupSection); setRecupSupa(s); }
                   }} className="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm font-semibold transition-colors">
-                    🔄 Restaurer dans Supabase
+                    🔄 Ajouter les lignes manquantes dans Supabase
                   </button>
                 </div>
               </>}
@@ -2330,8 +2411,20 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const parAnnee = anneeDash ? arr.filter(r=>{ const d = r.annee ? String(r.annee) : (r.date||r.date_evenement)?.slice(0,4); return d===anneeDash; }) : arr;
         if(ft==="week")return parAnnee.filter(r=>r.semaine===sw); if(ft==="month")return parAnnee.filter(r=>r.mois===sm); if(ft==="year")return parAnnee; return parAnnee;
       },[ft,sw,sm,anneeDash]);
+      // Filtre adhésions (v4.2.1) : certaines adhésions (surtout structures) n'ont pas de date_adhesion
+      // précise dans l'historique repris — donc pas de semaine/mois calculable. Le filtre générique
+      // fil() les excluait silencieusement des vues Semaine/Mois (montant "manquant" à tort). Ici,
+      // une adhésion sans semaine/mois connu reste TOUJOURS comptée, quelle que soit la période
+      // affichée, plutôt que de disparaître du total — indiv. et structure sont ainsi toujours
+      // toutes les deux incluses dans le montant total de la période.
+      const filAdh=useCallback((arr)=>{
+        const parAnnee = anneeDash ? arr.filter(r=>String(r.annee)===anneeDash) : arr;
+        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw || !r.semaine);
+        if(ft==="month")return parAnnee.filter(r=>r.mois===sm || r.mois==null);
+        return parAnnee;
+      },[ft,sw,sm,anneeDash]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
-      const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation),fADH=fil(allData.adhesion),fRC=fil(allData.restocollective);
+      const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation),fADH=filAdh(allData.adhesion),fRC=fil(allData.restocollective);
       const tTA=sum(fTA),tTCAM=sum(fTCAM,"montant"),tD=sum(fD,"montant"),tA=sum(fA,"montant"),tP=sum(fP,"montant_facture"),tADH=sum(fADH,"total"),tRC=sum(fRC,"prix_total");
       const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; exportToXLSX(cafe,p,ft,allData); };
       const [anneeAdh,setAnneeAdh]=useState(defaultAnneeAdhesion());
@@ -2702,6 +2795,15 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const parAnnee = anneeDash ? safeArr(arr).filter(r=>{ const d = r.annee ? String(r.annee) : (r.date||r.date_evenement)?.slice(0,4); return d===anneeDash; }) : safeArr(arr);
         if(ft==="week")return parAnnee.filter(r=>r.semaine===sw); if(ft==="month")return parAnnee.filter(r=>r.mois===sm); return parAnnee;
       },[ft,sw,sm,anneeDash]);
+      // Filtre adhésions (v4.2.1) : voir Dashboard café — une adhésion sans semaine/mois connu
+      // (souvent une structure importée sans date précise) reste toujours comptée dans le total
+      // de la période, indiv. et structure confondues.
+      const filAdh=useCallback((arr)=>{
+        const parAnnee = anneeDash ? safeArr(arr).filter(r=>String(r.annee)===anneeDash) : safeArr(arr);
+        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw || !r.semaine);
+        if(ft==="month")return parAnnee.filter(r=>r.mois===sm || r.mois==null);
+        return parAnnee;
+      },[ft,sw,sm,anneeDash]);
       const sum=(arr,k="prix_total")=>{ const r=safeArr(arr).reduce((s,r)=>s+(parseFloat(r[k])||0),0); return isFinite(r)?r:0; };
 
       // Guard : afficher spinner si données pas encore chargées — AVANT tout calcul
@@ -2716,7 +2818,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
       let stats = [], GT = {ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0};
       try {
-        stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=fil(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=n(sum(fTA)),tc=n(sum(fTC,"montant")),dn=n(sum(fD,"montant")),ac=n(sum(fA,"montant")),pv=n(sum(fP,"montant_facture")),adh=n(sum(fADH,"total")),rc=n(sum(fRC,"prix_total")); return{cafe,ta,tc,dn,ac,pv,adh,rc,total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH}; });
+        stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=filAdh(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=n(sum(fTA)),tc=n(sum(fTC,"montant")),dn=n(sum(fD,"montant")),ac=n(sum(fA,"montant")),pv=n(sum(fP,"montant_facture")),adh=n(sum(fADH,"total")),rc=n(sum(fRC,"prix_total")); return{cafe,ta,tc,dn,ac,pv,adh,rc,total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH}; });
         GT=stats.reduce((s,c)=>({ta:s.ta+n(c.ta),tc:s.tc+n(c.tc),dn:s.dn+n(c.dn),ac:s.ac+n(c.ac),pv:s.pv+n(c.pv),adh:s.adh+n(c.adh),rc:s.rc+n(c.rc),total:s.total+n(c.total)}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0});
       } catch(statsErr) { console.error("STATS CRASH:", statsErr.message, statsErr.stack); }
 
@@ -4010,6 +4112,15 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const isReadOnly = isDirecteur;
       const isMulti = isAdmin || isOps || isDirecteur;
 
+      // v4.2.1 : un café créé pendant qu'une session Opérations/Directeur/Admin est déjà ouverte
+      // (sans reconnexion) doit devenir visible automatiquement — la liste des cafés est donc
+      // aussi rafraîchie périodiquement pour ces rôles, pas seulement au chargement de la page.
+      useEffect(()=>{
+        if (!isMulti) return;
+        const t = setInterval(()=>{ loadCafesListRemote().then(setCafes); }, 60000);
+        return ()=>clearInterval(t);
+      },[isMulti]);
+
       // Propage le rôle courant au verrou de sécurité de saveData (défense en profondeur)
       useEffect(()=>{ setCurrentRole(session?.role||null); }, [session]);
       const activeCafe = isMulti ? (selCafe || cafes[0]) : (session?.cafe || null);
@@ -4038,15 +4149,12 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const onDone  = () => { setSaving(false); };
         const onError = (e) => {
           setSaving(false);
-          // v4.2.0 : message corrigé — l'ancien texte ("Sauvegarde en cours…") donnait l'impression
-          // à tort que tout allait bien, alors que la sauvegarde avait ÉCHOUÉ et attendait une reprise.
-          setSaveError("⚠️ Connexion au serveur impossible — vos données sont conservées sur cet appareil et seront envoyées automatiquement dès le retour du réseau. NE FERMEZ PAS cette page tant que ce message est affiché.");
-          // Pas de disparition automatique : reste affiché jusqu'à daddy_queue_flushed (reprise réussie).
+          // v4.2.1 : message informatif, toujours auto-refermant — pas de file de reprise
+          // automatique en arrière-plan (supprimée) : les données restent sûres en local,
+          // et 🛟 Récupération d'urgence est le filet de sécurité manuel si besoin.
+          setSaveError("⚠️ Connexion au serveur impossible pour cette sauvegarde — vos données restent conservées sur cet appareil (🛟 Récupération d'urgence si besoin).");
+          setTimeout(()=>setSaveError(null), 8000);
         };
-        const onQueuePending = (e) => {
-          setSaveError(`⚠️ ${e.detail.count} sauvegarde(s) en attente de connexion — NE FERMEZ PAS cette page tant que ce message est affiché.`);
-        };
-        const onQueueFlushed = () => { setSaveError(null); };
         const onReadOnlyBlock = () => {
           setSaving(false);
           setSaveError("🔒 Mode lecture seule (Directeur) — modification impossible.");
@@ -4054,20 +4162,17 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         };
         const onLocalStorageError = (e) => {
           setSaveError("🚨 Stockage local plein ou indisponible sur cet appareil — les sauvegardes de secours ne fonctionnent plus ici. Rechargez la page ; si le problème persiste, videz le cache du navigateur ou utilisez un autre appareil.");
+          setTimeout(()=>setSaveError(null), 10000);
         };
         window.addEventListener("daddy_save_start", onStart);
         window.addEventListener("daddy_save_done",  onDone);
         window.addEventListener("daddy_save_error", onError);
-        window.addEventListener("daddy_queue_pending", onQueuePending);
-        window.addEventListener("daddy_queue_flushed", onQueueFlushed);
         window.addEventListener("daddy_readonly_block", onReadOnlyBlock);
         window.addEventListener("daddy_localstorage_error", onLocalStorageError);
         return () => {
           window.removeEventListener("daddy_save_start", onStart);
           window.removeEventListener("daddy_save_done",  onDone);
           window.removeEventListener("daddy_save_error", onError);
-          window.removeEventListener("daddy_queue_pending", onQueuePending);
-          window.removeEventListener("daddy_queue_flushed", onQueueFlushed);
           window.removeEventListener("daddy_readonly_block", onReadOnlyBlock);
           window.removeEventListener("daddy_localstorage_error", onLocalStorageError);
         };
@@ -4133,6 +4238,17 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           loadAllCafes();
         }
       }, [cafes]);
+
+      // v4.2.1 : un nouveau café apparu dans la liste (rafraîchie périodiquement ci-dessus,
+      // ou juste après sa création par un Admin) doit apparaître en Vue globale sans qu'il
+      // soit besoin de se reconnecter — on force alors un rechargement complet des données.
+      const _prevCafesLenRef = useRef(cafes.length);
+      useEffect(()=>{
+        if (cafes.length > _prevCafesLenRef.current && globalView) {
+          loadAllCafes(true);
+        }
+        _prevCafesLenRef.current = cafes.length;
+      }, [cafes.length]);
 
       // Login screen
       if (!session) {
