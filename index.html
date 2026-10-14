@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.2.1 · Build du 23/09/2026 -->
+<!-- DaddyPay v4.3.0 · Build du 14/10/2026 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -52,8 +52,16 @@
         if (!r.ok) { const t = await r.text().catch(()=>""); console.error("Supabase error", r.status, t); return null; }
         // 204 No Content (succès sans body)
         if (r.status === 204) return true;
-        // Protéger r.json() contre les réponses vides ou tronquées (réseau instable)
-        try { return await r.json(); }
+        // v4.3.0 : un INSERT/UPDATE avec "Prefer: return=minimal" répond 201 avec un corps VIDE.
+        // Avant, r.json() échouait sur ce corps vide et supaFetch renvoyait null, donc saveData
+        // signalait un échec alors que l'enregistrement avait réussi (faux message "connexion impossible").
+        // Corps vide + statut 2xx = succès.
+        let txt = "";
+        try { txt = await r.text(); }
+        catch(textErr) { console.error("supaFetch: lecture de la réponse impossible", textErr.message); return null; }
+        if (!txt) return true;
+        // Protéger le parsing contre les réponses tronquées (réseau instable)
+        try { return JSON.parse(txt); }
         catch(jsonErr) { console.error("supaFetch: réponse JSON invalide", jsonErr.message); return null; }
       } catch(e) {
         clearTimeout(timer);
@@ -228,13 +236,14 @@
     // Colonnes fixes — les colonnes "Réseau : X" sont ajoutées dynamiquement à la fin
     // selon les réseaux existants (voir buildAdherentsColOrder).
     const CSV_COL_ORDER_ADHERENTS = [
-      "Café","Structure","civilite","prenom","nom","contact_nom","adresse","code_postal","mail","telephone",
+      "Café","Structure","civilite","prenom","nom","contact_nom","nb_adherents_structure","adresse","code_postal","mail","telephone",
       "date_naissance","annee_adhesion","Montant d'adhésion","mode de règlement",
       "adhesion_offerte","renouvellement","de_passage","resident","source_arrivee",
       "roles_additionnels \"bénévole\"","Bénévole : date formation","Bénévole : date début","Bénévole : date fin","Bénévole : intéressé(e)",
       "roles_additionnels \"Talentueux\"","Talentueux : date formation","Talentueux : date début","Talentueux : date fin","Talentueux : intéressé(e)",
       "roles_additionnels \"Tisseur de Lien\"","Tisseur de Lien : date formation","Tisseur de Lien : date début","Tisseur de Lien : date fin","Tisseur de Lien : intéressé(e)",
-      "talents","id","by","created_le"
+      "talents","id","by","created_le",
+      "exclusion","date_exclusion"
     ];
     // Construit la liste de colonnes complète : colonnes fixes + 1 colonne "Réseau : X" par réseau, en fin de fichier
     const buildAdherentsColOrder = (reseauxNoms) => [...CSV_COL_ORDER_ADHERENTS, ...reseauxNoms.map(n=>`Réseau : ${n}`)];
@@ -594,6 +603,33 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
         return Array.isArray(rows[0].data) ? rows[0].data : [];
       } catch { return null; } // null = lecture impossible (à distinguer d'un [] serveur réellement vide)
     };
+    // v4.3.0 : tri d'AFFICHAGE "plus récent en haut", indépendant de l'ordre de stockage du tableau.
+    // Sans ça, les listes (Caisse TA, TCAM, Dons, Achats, Resto collective) affichaient les 100 premières
+    // lignes du tableau tel que stocké : depuis la fusion par id (v4.2.1), les lignes nouvellement
+    // enregistrées pouvaient se retrouver en fin de tableau, donc hors des 100 lignes affichées.
+    // Tri : horodatage d'enregistrement décroissant ; à égalité (même minute), les ids consécutifs
+    // d'une même validation (un panier) restent groupés dans leur ordre de saisie, le groupe le plus récent en premier.
+    const sortRecentFirst = (arr) => {
+      const key = r => r.recorded_at || r.date || "";
+      const byTime = [...(arr||[])].sort((a,b) => key(b).localeCompare(key(a)));
+      const out = [];
+      let i = 0;
+      while (i < byTime.length) {
+        let j = i;
+        while (j < byTime.length && key(byTime[j]) === key(byTime[i])) j++;
+        const grp = byTime.slice(i, j).sort((a,b) => (a.id||0) - (b.id||0));
+        const runs = []; let cur = [];
+        grp.forEach(r => {
+          if (cur.length && r.id === cur[cur.length-1].id + 1) cur.push(r);
+          else { if (cur.length) runs.push(cur); cur = [r]; }
+        });
+        if (cur.length) runs.push(cur);
+        runs.reverse().forEach(run => out.push(...run));
+        i = j;
+      }
+      return out;
+    };
+
     // Mutex par clé (cafe:section) — empêche les DELETE+INSERT entrelacés
     const _saveLocks  = new Map(); // clé → Promise en cours
     const _savePending = new Map(); // clé → dernière data en attente
@@ -653,10 +689,10 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
         // sinon : on l'avait (baseline) et on ne l'a plus (local) → suppression volontaire, on l'omet
         seen.add(srow.id);
       }
-      for (const lrow of localData) {
-        if (!seen.has(lrow.id)) merged.push(lrow); // nouvelle ligne locale, pas encore côté serveur
-      }
-      return merged;
+      // Nouvelles lignes locales (pas encore côté serveur) : placées EN TÊTE, comme partout dans l'app
+      // (les saisies sont ajoutées en haut du tableau).
+      const fresh = localData.filter(lrow => !seen.has(lrow.id));
+      return [...fresh, ...merged];
     };
 
     const saveData = async (cafe, section, data, opts={}) => {
@@ -899,6 +935,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
           prenom: r.prenom,
           nom: r.nom?.toUpperCase(),
           contact_nom: r.contact_nom,
+          nb_adherents_structure: r.structure ? (r.nb_adherents_structure ?? "") : "",
           adresse: r.adresse,
           code_postal: r.code_postal,
           mail: r.mail,
@@ -931,6 +968,8 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
           id: r.id,
           by: r.by||"",
           created_le: r.created_at ? r.created_at.slice(0,10).split("-").reverse().join("/") : "",
+          exclusion: r.exclu ? "oui" : "non",
+          date_exclusion: r.exclu ? (r.date_exclusion||"") : "",
         };
         // Une colonne par réseau existant, en fin de fichier — oui/non
         reseauxNoms.forEach(nom => { out[`Réseau : ${nom}`] = (r.reseaux||[]).includes(nom) ? "oui" : "non"; });
@@ -1020,7 +1059,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.2.1 · Build du 23/09/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.3.0 · Build du 14/10/2026</p>
             </div>
           </div>
         </div>
@@ -1693,7 +1732,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </div>
             </div>
           </div>
-          <TableWrapper headers={["Date","Semaine","Produit","Qté","P.U. TTC","TVA","Total TTC","Mode","Typo","Suppr."]} rows={rows.slice(0,100).map(r=>[r.date,r.semaine,r.produit,r.qte,`${r.prix_unitaire}€`,(r.tva_taux&&r.tva_taux!=="0")?<span className="text-xs bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded font-medium">{r.tva_taux}%</span>:<span className="text-xs text-gray-300">—</span>,<strong>{r.prix_total?.toFixed(2)}€</strong>,<Badge color={r.mode==="CB"?"sky":r.mode==="Espèces"?"amber":r.mode==="Chèque"?"violet":"emerald"}>{r.mode}</Badge>,r.typo,isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
+          <TableWrapper headers={["Date","Semaine","Produit","Qté","P.U. TTC","TVA","Total TTC","Mode","Typo","Suppr."]} rows={sortRecentFirst(rows).slice(0,100).map(r=>[r.date,r.semaine,r.produit,r.qte,`${r.prix_unitaire}€`,(r.tva_taux&&r.tva_taux!=="0")?<span className="text-xs bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded font-medium">{r.tva_taux}%</span>:<span className="text-xs text-gray-300">—</span>,<strong>{r.prix_total?.toFixed(2)}€</strong>,<Badge color={r.mode==="CB"?"sky":r.mode==="Espèces"?"amber":r.mode==="Chèque"?"violet":"emerald"}>{r.mode}</Badge>,r.typo,isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
         </div>
       );
     };
@@ -1734,7 +1773,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </div>
             </div>
           </div>
-          <TableWrapper headers={["Date","Semaine","Événement","P.U.","Qté","Montant","Mode","Suppr."]} rows={rows.slice(0,100).map(r=>[r.date,r.semaine,r.evenement,r.pu?`${r.pu}€`:"-",r.qte||"-",<strong>{r.montant?.toFixed(2)}€</strong>,<Badge color="amber">{r.mode}</Badge>,isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
+          <TableWrapper headers={["Date","Semaine","Événement","P.U.","Qté","Montant","Mode","Suppr."]} rows={sortRecentFirst(rows).slice(0,100).map(r=>[r.date,r.semaine,r.evenement,r.pu?`${r.pu}€`:"-",r.qte||"-",<strong>{r.montant?.toFixed(2)}€</strong>,<Badge color="amber">{r.mode}</Badge>,isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
         </div>
       );
     };
@@ -1768,7 +1807,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </div>
             </div>
           </div>
-          <TableWrapper headers={["Date","Semaine","Produit","Montant","Mode","Reçu fiscal","Commentaire","Suppr."]} rows={rows.slice(0,100).map(r=>[r.date,r.semaine,r.produit,<strong>{r.montant?.toFixed(2)}€</strong>,<Badge color="rose">{r.mode}</Badge>,r.recu_fiscal==="oui"?"✅ Oui":"Non",<span className="text-xs text-gray-500">{r.commentaire}</span>,isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
+          <TableWrapper headers={["Date","Semaine","Produit","Montant","Mode","Reçu fiscal","Commentaire","Suppr."]} rows={sortRecentFirst(rows).slice(0,100).map(r=>[r.date,r.semaine,r.produit,<strong>{r.montant?.toFixed(2)}€</strong>,<Badge color="rose">{r.mode}</Badge>,r.recu_fiscal==="oui"?"✅ Oui":"Non",<span className="text-xs text-gray-500">{r.commentaire}</span>,isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
         </div>
       );
     };
@@ -1809,7 +1848,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </div>
             </div>
           </div>
-          <TableWrapper headers={["Date","Semaine","Fournisseur","Destination","Montant","Mode","Facture","Suppr."]} rows={rows.slice(0,100).map(r=>[r.date,r.semaine,r.fournisseur,<Badge color="sky">{r.destination}</Badge>,<strong>{r.montant?.toFixed(2)}€</strong>,r.mode,r.facture_teams==="oui"?"✅":"❌",isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
+          <TableWrapper headers={["Date","Semaine","Fournisseur","Destination","Montant","Mode","Facture","Suppr."]} rows={sortRecentFirst(rows).slice(0,100).map(r=>[r.date,r.semaine,r.fournisseur,<Badge color="sky">{r.destination}</Badge>,<strong>{r.montant?.toFixed(2)}€</strong>,r.mode,r.facture_teams==="oui"?"✅":"❌",isReadOnly?<span className="text-xs text-gray-300">—</span>:<button onClick={()=>setConfirmId(r.id)} className="text-rose-400 hover:text-rose-600 text-xs">✕</button>])}/>
         </div>
       );
     };
@@ -2419,13 +2458,18 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       // toutes les deux incluses dans le montant total de la période.
       const filAdh=useCallback((arr)=>{
         const parAnnee = anneeDash ? arr.filter(r=>String(r.annee)===anneeDash) : arr;
-        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw || !r.semaine);
-        if(ft==="month")return parAnnee.filter(r=>r.mois===sm || r.mois==null);
+        // v4.3.0 : filtre STRICT (corrige v4.2.1). L'ancienne version ajoutait "|| !r.semaine" : toute adhésion
+        // sans semaine calculable (date vide ou hors des semaines 2026, ex. adhésion datée de 2025) était
+        // comptée dans CHAQUE semaine affichée, ce qui gonflait le nombre de saisies (ex. 60 au lieu de 1).
+        // Les adhésions sans date ont été datées en base (1er janvier) : plus besoin de cette tolérance.
+        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw);
+        if(ft==="month")return parAnnee.filter(r=>r.mois===sm);
         return parAnnee;
       },[ft,sw,sm,anneeDash]);
       const sum=(arr,k="prix_total")=>arr.reduce((s,r)=>s+(parseFloat(r[k])||0),0);
       const fTA=fil(allData.caisseta),fTCAM=fil(allData.tcam),fD=fil(allData.dons),fA=fil(allData.achats),fP=fil(allData.privatisation),fADH=filAdh(allData.adhesion),fRC=fil(allData.restocollective);
       const tTA=sum(fTA),tTCAM=sum(fTCAM,"montant"),tD=sum(fD,"montant"),tA=sum(fA,"montant"),tP=sum(fP,"montant_facture"),tADH=sum(fADH,"total"),tRC=sum(fRC,"prix_total");
+      const nbAdhIndiv=sum(fADH,"nb_indiv"), nbAdhStruc=sum(fADH,"nb_struc"); // v4.3.0 : nb de saisies d'adhésion = indiv. + structures
       const handleExport=()=>{ const p=ft==="week"?sw:ft==="month"?`M${sm}`:"all"; exportToXLSX(cafe,p,ft,allData); };
       const [anneeAdh,setAnneeAdh]=useState(defaultAnneeAdhesion());
       const handleExportAdherents=()=>exportAdherentsCSV(cafe,anneeAdh);
@@ -2451,7 +2495,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             <StatCard label="Total Dons" value={`${tD.toFixed(2)} €`} sub={`${fD.length} dons`} color="rose"/>
             <StatCard label="Total Achats" value={`${tA.toFixed(2)} €`} sub={`${fA.length} achats`} color="sky"/>
             <StatCard label="Privatisations" value={`${tP.toFixed(2)} €`} sub={`${fP.filter(r=>r.type_paiement!=="acompte").length} événements`} color="violet"/>
-            <StatCard label="Adhésions" value={`${tADH.toFixed(2)} €`} sub={`${fADH.length} saisies`} color="violet"/>
+            <StatCard label="Adhésions" value={`${tADH.toFixed(2)} €`} sub={`${nbAdhIndiv+nbAdhStruc} saisies (${nbAdhIndiv} indiv. + ${nbAdhStruc} struct.)`} color="violet"/>
             {(rcOn||tRC>0)&&<StatCard label="Resto Collective" value={`${tRC.toFixed(2)} €`} sub={`${fRC.length} lignes (TTC)`} color="amber"/>}
             <StatCard label="Total encaissé" value={`${(tTA+tTCAM+tD+tP+tADH+tRC).toFixed(2)} €`} sub="TA + TCAM + Dons + Privat. + Adh. + RC" color="emerald"/>
             {(()=>{
@@ -2612,6 +2656,16 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                         {totalM.map((v,i)=><td key={i} className={`px-2 py-2 text-right ${b.colorV}`}>{v||"—"}</td>)}
                         <td className={`px-3 py-2 text-right font-bold ${b.color}`}>{totTotal}</td>
                       </tr>);
+                      // v4.3.0 : bloc Structures uniquement, nombre d'adhérents amenés par les structures
+                      if (b.label==="Structures") {
+                        const nbConcM = byMonthAdh(b.data, m=>m.reduce((s,a)=>s+(parseInt(a.nb_adherents_structure,10)||0),0));
+                        const totNbConc = nbConcM.reduce((a,c)=>a+c,0);
+                        rows.push(<tr key={b.label+"_nbc"} className="hover:bg-gray-50">
+                          <td className={`px-3 py-2 ${b.color}`}>{b.label} — Nb adhérents concernés</td>
+                          {nbConcM.map((v,i)=><td key={i} className={`px-2 py-2 text-right ${b.colorV}`}>{v||"—"}</td>)}
+                          <td className={`px-3 py-2 text-right font-bold ${b.color}`}>{totNbConc}</td>
+                        </tr>);
+                      }
                       rows.push(<tr key={b.label+"_new"} className="hover:bg-gray-50">
                         <td className="px-3 py-2 text-gray-600">{b.label} — Nb nouveaux</td>
                         {nouveauxM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-gray-500">{v||"—"}</td>)}
@@ -2800,8 +2854,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       // de la période, indiv. et structure confondues.
       const filAdh=useCallback((arr)=>{
         const parAnnee = anneeDash ? safeArr(arr).filter(r=>String(r.annee)===anneeDash) : safeArr(arr);
-        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw || !r.semaine);
-        if(ft==="month")return parAnnee.filter(r=>r.mois===sm || r.mois==null);
+        // v4.3.0 : filtre STRICT (voir Dashboard café) : une adhésion sans semaine/mois calculable
+        // n'est plus ajoutée à chaque période affichée.
+        if(ft==="week")return parAnnee.filter(r=>r.semaine===sw);
+        if(ft==="month")return parAnnee.filter(r=>r.mois===sm);
         return parAnnee;
       },[ft,sw,sm,anneeDash]);
       const sum=(arr,k="prix_total")=>{ const r=safeArr(arr).reduce((s,r)=>s+(parseFloat(r[k])||0),0); return isFinite(r)?r:0; };
@@ -3008,7 +3064,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   const totTotal = totalM.reduce((a,b)=>a+b,0), totNouveaux = nouveauxM.reduce((a,b)=>a+b,0), totMontant = montantM.reduce((a,b)=>a+b,0), totMontantIncl = montantInclM.reduce((a,b)=>a+b,0);
                   const moyenneM = montantInclM.map((v,i)=>totalM[i]>0?v/totalM[i]:0);
                   const moyenneTot = totTotal>0?totMontantIncl/totTotal:0;
-                  return { cafe:c, totalM, nouveauxM, montantM, montantInclM, moyenneM, moyenneTot,
+                  // v4.3.0 : nombre d'adhérents amenés par les structures (structures uniquement)
+                  const nbConcM = moisSel.map(m=>adherents.filter(a=>a.structure && getMonthForDate(a.date_adhesion)===m).reduce((s,a)=>s+(parseInt(a.nb_adherents_structure,10)||0),0));
+                  const totNbConc = nbConcM.reduce((a,b)=>a+b,0);
+                  return { cafe:c, totalM, nouveauxM, montantM, montantInclM, moyenneM, moyenneTot, nbConcM, totNbConc,
                     totTotal, totNouveaux, totMontant, totMontantIncl };
                 });
                 const sumCol = (key) => moisSel.map((_,i)=>perCafeMonth.reduce((s,c)=>s+c[key][i],0));
@@ -3043,11 +3102,16 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                         {perCafeMonth.map(c=>(
                           <React.Fragment key={c.cafe}>
                             <tr className="border-t-2 border-gray-100 hover:bg-gray-50">
-                              <td rowSpan={5} className="px-3 py-2 font-semibold text-gray-800 align-top border-r border-gray-50">{c.cafe}</td>
+                              <td rowSpan={adhFilter==="indiv"?5:6} className="px-3 py-2 font-semibold text-gray-800 align-top border-r border-gray-50">{c.cafe}</td>
                               <td className="px-3 py-2 text-violet-700">Nb total adhérents</td>
                               {c.totalM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-violet-600">{fmtN(v)}</td>)}
                               <td className="px-3 py-2 text-right font-bold text-violet-700">{c.totTotal}</td>
                             </tr>
+                            {adhFilter!=="indiv" && <tr className="hover:bg-gray-50">
+                              <td className="px-3 py-2 text-amber-700">Nb adhérents concernés (structures)</td>
+                              {c.nbConcM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-amber-600">{fmtN(v)}</td>)}
+                              <td className="px-3 py-2 text-right font-bold text-amber-700">{c.totNbConc}</td>
+                            </tr>}
                             <tr className="hover:bg-gray-50">
                               <td className="px-3 py-2 text-sky-700">Nb nouveaux adhérents</td>
                               {c.nouveauxM.map((v,i)=><td key={i} className="px-2 py-2 text-right text-sky-600">{fmtN(v)}</td>)}
@@ -3234,6 +3298,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       montant_devis_legacy: 0,
     });
 
+    // v4.3.0 : prénom saisi avec une majuscule initiale par défaut (début de chaque mot, y compris après un tiret).
+    // Le reste des lettres est laissé tel que saisi (pas de passage forcé en minuscules).
+    const capitalizePrenom = (s) => (s||"").replace(/(^|[\s\-'’,])([a-zà-öø-ÿ])/g, (m, sep, ch) => sep + ch.toUpperCase());
     const mkAdherentForm = () => ({
       id: null,
       date_adhesion: new Date().toISOString().slice(0,10),
@@ -3242,6 +3309,9 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       prenom: "",
       nom: "",
       contact_nom: "",
+      nb_adherents_structure: "", // v4.3.0 : nombre d'adhérents amenés par la structure (structures uniquement)
+      exclu: false,            // v4.3.0 : adhérent exclu de TOUS les cafés
+      date_exclusion: "",      // v4.3.0 : date de l'exclusion (obligatoire si exclu)
       adresse: "",
       code_postal: "",
       ville: "",
@@ -3278,10 +3348,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const annee = parseInt(a.annee_adhesion) || parseInt((a.date_adhesion||"").slice(0,4)) || null;
         const cle = `${annee}_${sem}`; // évite qu'une même semaine (S12) de deux années différentes ne fusionne
         if (!bySemaine[cle]) {
-          bySemaine[cle] = { semaine: sem, mois: getMonthForDate(a.date_adhesion), annee, total: 0 };
+          bySemaine[cle] = { semaine: sem, mois: getMonthForDate(a.date_adhesion), annee, total: 0, nb_indiv: 0, nb_struc: 0 };
           MODES_ADH.forEach(m => { bySemaine[cle][`indiv_${m}`]=0; bySemaine[cle][`struc_${m}`]=0; });
         }
         const montant = parseFloat(a.montant) || 0;
+        // v4.3.0 : nombre de saisies (1 par adhésion, individuelle ou structure, offertes comprises).
+        // Avant, le Dashboard comptait le nombre de lignes agrégées (1 par semaine), pas le nombre d'adhésions.
+        if (a.structure) bySemaine[cle].nb_struc += 1; else bySemaine[cle].nb_indiv += 1;
         // Une adhésion offerte (don>50€) est exclue du total adhésions mais incluse dans le total "incluant offertes"
         if (!a.adhesion_offerte) {
           const pfx = a.structure ? "struc" : "indiv";
@@ -3349,15 +3422,32 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
       // ── Dédoublonnage ──
       const norm = (s) => (s||"").trim().toLowerCase();
+      const ficheMatch = (r, f) => {
+        const sameNomPrenom = norm(r.nom)===norm(f.nom) && norm(r.prenom)===norm(f.prenom) && norm(f.nom);
+        const sameNomEmail  = norm(r.nom)===norm(f.nom) && norm(r.mail)===norm(f.mail) && norm(f.mail);
+        const samePrenomEmail = norm(r.prenom)===norm(f.prenom) && norm(r.mail)===norm(f.mail) && norm(f.mail);
+        const sameTel = norm(r.telephone)===norm(f.telephone) && norm(f.telephone);
+        return sameNomPrenom || sameNomEmail || samePrenomEmail || sameTel;
+      };
       const findDuplicates = (f, allRows) => {
         return allRows.filter(r => {
           if (editId && r.id===editId) return false;
-          const sameNomPrenom = norm(r.nom)===norm(f.nom) && norm(r.prenom)===norm(f.prenom) && norm(f.nom);
-          const sameNomEmail  = norm(r.nom)===norm(f.nom) && norm(r.mail)===norm(f.mail) && norm(f.mail);
-          const samePrenomEmail = norm(r.prenom)===norm(f.prenom) && norm(r.mail)===norm(f.mail) && norm(f.mail);
-          const sameTel = norm(r.telephone)===norm(f.telephone) && norm(f.telephone);
-          return sameNomPrenom || sameNomEmail || samePrenomEmail || sameTel;
+          return ficheMatch(r, f);
         });
+      };
+      // v4.3.0 : un adhérent exclu l'est dans TOUS les cafés. À la création d'une fiche, on relit
+      // (lecture pure, sans toucher au cache) les adhérents des AUTRES cafés et on remonte les fiches
+      // exclues qui correspondent (mêmes critères que le dédoublonnage). Le café courant est déjà
+      // couvert par findDuplicates (sur les lignes locales).
+      const findExcludedElsewhere = async (f) => {
+        const others = (cafes||[]).filter(c => c !== cafe);
+        let unreadable = 0;
+        const lists = await Promise.all(others.map(async c => {
+          const d = await peekServerData(c, "adherents");
+          if (d === null) { unreadable++; return []; }
+          return d.filter(r => r.exclu && ficheMatch(r, f)).map(r => ({...r, _cafe: c}));
+        }));
+        return { matches: lists.flat(), unreadable };
       };
 
       const doSave = async (f, allRows) => {
@@ -3400,7 +3490,18 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
 
         // Date d'adhésion vide (ex: fiche dupliquée pour renouvellement) -> date du jour par défaut
         let f = form;
-        if (!f.date_adhesion) { f = {...f, date_adhesion: new Date().toISOString().slice(0,10)}; setForm(f); }
+        // v4.3.0 : normalisation à l'enregistrement (filet de sécurité, ex: fiche modifiée/dupliquée)
+        f = {...f,
+          nom: f.nom.trim().toUpperCase(),
+          prenom: capitalizePrenom((f.prenom||"").trim()),
+          contact_nom: capitalizePrenom((f.contact_nom||"").trim()),
+          nb_adherents_structure: f.structure ? (parseInt(f.nb_adherents_structure,10)||0) : "",
+          exclu: !!f.exclu,
+          date_exclusion: f.exclu ? (f.date_exclusion||"") : ""
+        };
+        if (f.exclu && !f.date_exclusion) { alert("La date d'exclusion est obligatoire lorsque la case Exclusion est cochée."); return; }
+        if (!f.date_adhesion) { f = {...f, date_adhesion: new Date().toISOString().slice(0,10)}; }
+        setForm(f);
 
         // Cohérence année d'adhésion / date du jour : OK si on est dans l'année N, ou en décembre de l'année N-1 (adhésions par anticipation)
         const today = new Date();
@@ -3416,7 +3517,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           setTelConfirm(true);
         }
 
-        const dups = findDuplicates(f, rows);
+        let dups = findDuplicates(f, rows);
+        // Contrôle exclusion dans les autres cafés (création uniquement)
+        if (!editId && !f.exclu && !dupAlert) {
+          const { matches, unreadable } = await findExcludedElsewhere(f);
+          if (unreadable > 0 && !window.confirm(`Impossible de vérifier les exclusions dans ${unreadable} café(s) (réseau).\n\nContinuer quand même ?`)) return;
+          dups = [...dups, ...matches];
+        }
         if (dups.length > 0 && !dupAlert) {
           setDupAlert({ matches: dups, pendingForm: f });
           return;
@@ -3429,7 +3536,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const duplicateRow = (r) => {
         if (isReadOnly) return;
         const nextYear = (parseInt(r.annee_adhesion)||new Date().getFullYear()) + 1;
-        setForm({...r, id:null, annee_adhesion: nextYear, date_adhesion:"", renouvellement:true, created_at:null});
+        setForm({...r, id:null, annee_adhesion: nextYear, date_adhesion:"", renouvellement:true, created_at:null, exclu:false, date_exclusion:""});
         setEditId(null);
         window.scrollTo({top:0,behavior:"smooth"});
       };
@@ -3455,14 +3562,14 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         return Object.entries(filters).every(([k,v]) => {
           if (!v) return true;
           if (k==="structure") return v==="oui" ? r.structure : !r.structure;
-          if (k==="renouvellement"||k==="de_passage"||k==="adhesion_offerte"||k==="resident") return v==="oui" ? !!r[k] : !r[k];
+          if (k==="renouvellement"||k==="de_passage"||k==="adhesion_offerte"||k==="resident"||k==="exclu") return v==="oui" ? !!r[k] : !r[k];
           const val = r[k];
           return String(val??"").toLowerCase().includes(v.toLowerCase());
         });
       }).sort((a,b) => {
         if (!sortCol) return (b.created_at||"").localeCompare(a.created_at||""); // défaut : plus récents en haut
         let va = a[sortCol], vb = b[sortCol];
-        if (sortCol==="montant") { va = parseFloat(va)||0; vb = parseFloat(vb)||0; }
+        if (sortCol==="montant"||sortCol==="nb_adherents_structure") { va = parseFloat(va)||0; vb = parseFloat(vb)||0; }
         else { va = String(va??"").toLowerCase(); vb = String(vb??"").toLowerCase(); }
         const cmp = va < vb ? -1 : va > vb ? 1 : 0;
         return sortDir==="asc" ? cmp : -cmp;
@@ -3512,6 +3619,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                   <p className="text-xs font-semibold text-gray-400 uppercase mb-1">Adhésion</p>
                   <p className="text-gray-600">Année d'adhésion : <strong>{d.annee_adhesion}</strong></p>
                   <p className="text-gray-600">Date d'adhésion : <strong>{d.date_adhesion}</strong></p>
+                  {d.structure && d.nb_adherents_structure!==undefined && d.nb_adherents_structure!==null && d.nb_adherents_structure!=="" && <p className="text-gray-600">Nombre d'adhérents concernés : <strong>{d.nb_adherents_structure}</strong></p>}
                   {d.renouvellement && <p className="text-gray-600">Renouvellement</p>}
                 </div>
               </div>
@@ -3538,9 +3646,10 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         {k:"prenom", label:"Prénom", w:"w-28", sortable:true},
         {k:"nom", label:"NOM", w:"w-28", sortable:true},
         {k:"contact_nom", label:"Contact", w:"w-28", sortable:true},
+        {k:"nb_adherents_structure", label:"Nb adh. amenés", w:"w-24", sortable:true},
         {k:"adresse", label:"Adresse", w:"w-36"},
         {k:"code_postal", label:"CP", w:"w-16"},
-        {k:"mail", label:"Mail", w:"w-36"},
+        {k:"mail", label:"Mail", w:"w-36", sortable:true},
         {k:"telephone", label:"Tél.", w:"w-28"},
         {k:"date_naissance", label:"Naiss.", w:"w-24"},
         {k:"annee_adhesion", label:"Année", w:"w-20"},
@@ -3559,6 +3668,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         {k:"_interets", label:"Intérêts", w:"w-32"},
         {k:"talents", label:"Talents", w:"w-32"},
         {k:"created_at", label:"Créé le", w:"w-28"},
+        {k:"exclu", label:"Exclu", w:"w-24", type:"select", options:[["oui","Oui"],["non","Non"]]},
       ];
 
       return (
@@ -3566,17 +3676,18 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           {/* Alerte doublons */}
           {dupAlert && (
             <div className="bg-rose-50 border-2 border-rose-300 rounded-2xl p-5 space-y-3">
-              <p className="font-semibold text-rose-800">⚠️ Doublon(s) potentiel(s) détecté(s)</p>
+              <p className="font-semibold text-rose-800">{dupAlert.matches.some(m=>m.exclu) ? "🚫 Adhérent EXCLU détecté (et doublon(s) potentiel(s))" : "⚠️ Doublon(s) potentiel(s) détecté(s)"}</p>
               <p className="text-sm text-rose-700">Des adhérents existants ressemblent à cette fiche. Vous pouvez compléter une fiche existante ou confirmer la création d'une nouvelle fiche.</p>
               <div className="space-y-2">
                 {dupAlert.matches.map(m=>(
-                  <div key={m.id} className="bg-white border border-rose-200 rounded-xl p-3 flex justify-between items-center">
+                  <div key={(m._cafe||cafe)+":"+m.id} className={`bg-white border rounded-xl p-3 flex justify-between items-center ${m.exclu?"border-rose-500 border-2":"border-rose-200"}`}>
                     <div className="text-sm">
                       <p className="font-medium text-gray-800">{m.civilite} {m.prenom} {m.nom?.toUpperCase()}</p>
-                      <p className="text-xs text-gray-500">{m.mail} · {m.telephone} · Adhésion {m.annee_adhesion}</p>
+                      <p className="text-xs text-gray-500">{m.mail} · {m.telephone} · Adhésion {m.annee_adhesion} · Café {m._cafe||m.cafe||cafe}</p>
+                      {m.exclu && <p className="text-xs font-bold text-rose-700 mt-1">🚫 EXCLU(E) de tous les cafés depuis le {m.date_exclusion ? m.date_exclusion.split("-").reverse().join("/") : "(date non renseignée)"}</p>}
                     </div>
-                    <button onClick={()=>{ setForm({...m, id:m.id}); setEditId(m.id); setDupAlert(null); }}
-                      className="bg-amber-100 hover:bg-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-xs font-semibold">Compléter cette fiche</button>
+                    {!m._cafe && <button onClick={()=>{ setForm({...m, id:m.id}); setEditId(m.id); setDupAlert(null); }}
+                      className="bg-amber-100 hover:bg-amber-200 text-amber-800 px-3 py-1.5 rounded-lg text-xs font-semibold">Compléter cette fiche</button>}
                   </div>
                 ))}
               </div>
@@ -3596,17 +3707,25 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               <label htmlFor="structCheck" className="text-sm font-medium text-gray-700 cursor-pointer">Structure (entreprise / association)</label>
             </div>
 
+            <div className="flex items-center gap-3 mb-4 flex-wrap">
+              <input type="checkbox" id="exclCheck" checked={!!form.exclu} onChange={e=>{ const on=e.target.checked; setForm(f=>({...f,exclu:on,date_exclusion:on?(f.date_exclusion||new Date().toISOString().slice(0,10)):""})); }} className="w-4 h-4 accent-rose-500"/>
+              <label htmlFor="exclCheck" className="text-sm font-medium text-rose-700 cursor-pointer">Exclusion (exclu de tous les cafés)</label>
+              {form.exclu && <div className="flex items-center gap-2"><label className="text-xs text-gray-500">Date d'exclusion *</label><input type="date" value={form.date_exclusion||""} onChange={e=>setForm(f=>({...f,date_exclusion:e.target.value}))} className="border border-rose-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-rose-300"/></div>}
+            </div>
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
               <div><label className="text-xs text-gray-500 block mb-1">Date d'adhésion *</label><input type="date" value={form.date_adhesion} onChange={e=>setForm(f=>({...f,date_adhesion:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
 
               {!form.structure && <>
                 <div><label className="text-xs text-gray-500 block mb-1">Civilité *</label><select value={form.civilite} onChange={e=>setForm(f=>({...f,civilite:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"><option>Mme</option><option>M.</option><option>Autre</option></select></div>
-                <div><label className="text-xs text-gray-500 block mb-1">Prénom *</label><input maxLength={50} value={form.prenom} onChange={e=>setForm(f=>({...f,prenom:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
+                <div><label className="text-xs text-gray-500 block mb-1">Prénom *</label><input maxLength={50} value={form.prenom} onChange={e=>setForm(f=>({...f,prenom:capitalizePrenom(e.target.value)}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
               </>}
 
               <div><label className="text-xs text-gray-500 block mb-1">NOM *</label><input maxLength={80} value={form.nom} onChange={e=>setForm(f=>({...f,nom:e.target.value.toUpperCase()}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm uppercase focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>
 
-              {form.structure && <div><label className="text-xs text-gray-500 block mb-1">Contact (nom, prénom) *</label><input maxLength={80} value={form.contact_nom} onChange={e=>setForm(f=>({...f,contact_nom:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
+              {form.structure && <div><label className="text-xs text-gray-500 block mb-1">Contact (nom, prénom) *</label><input maxLength={80} value={form.contact_nom} onChange={e=>setForm(f=>({...f,contact_nom:capitalizePrenom(e.target.value)}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
+
+              {form.structure && <div><label className="text-xs text-gray-500 block mb-1">Nombre d'adhérents amenés par la structure</label><input type="text" inputMode="numeric" maxLength={6} value={form.nb_adherents_structure ?? ""} onChange={e=>setForm(f=>({...f,nb_adherents_structure:e.target.value.replace(/\D/g,"").slice(0,6)}))} placeholder="0" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
 
               {form.structure && <div className="col-span-2"><label className="text-xs text-gray-500 block mb-1">Adresse *</label><input maxLength={200} value={form.adresse} onChange={e=>setForm(f=>({...f,adresse:e.target.value}))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"/></div>}
 
@@ -3744,6 +3863,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                       <td className="px-2 py-2">{r.prenom}</td>
                       <td className="px-2 py-2 font-medium">{r.nom?.toUpperCase()}</td>
                       <td className="px-2 py-2">{r.contact_nom}</td>
+                      <td className="px-2 py-2">{r.structure ? (r.nb_adherents_structure ?? "") : ""}</td>
                       <td className="px-2 py-2 truncate max-w-32">{r.adresse}</td>
                       <td className="px-2 py-2">{r.code_postal}</td>
                       <td className="px-2 py-2 truncate max-w-32">{r.mail}</td>
@@ -3765,6 +3885,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                       <td className="px-2 py-2 truncate max-w-32 text-amber-700">{(r.interets||[]).join(", ")}</td>
                       <td className="px-2 py-2 truncate max-w-32">{r.talents}</td>
                       <td className="px-2 py-2">{r.created_at?r.created_at.slice(0,10).split("-").reverse().join("/"):""}</td>
+                      <td className="px-2 py-2 text-rose-700 font-semibold">{r.exclu?`🚫 ${r.date_exclusion?r.date_exclusion.split("-").reverse().join("/"):""}`:""}</td>
                     </tr>
                   );})}
                   {filteredRows.length===0 && <tr><td colSpan={COLS.length+1} className="text-center py-6 text-gray-400">Aucun adhérent ne correspond aux filtres.</td></tr>}
@@ -4051,7 +4172,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               </tr></thead>
               <tbody>
                 {rows.length===0?<tr><td colSpan={12} className="text-center py-8 text-gray-400 text-sm">Aucune donnée</td></tr>
-                  :rows.slice(0,100).map((r,i)=><tr key={i} className="border-t border-gray-50 hover:bg-gray-50">
+                  :sortRecentFirst(rows).slice(0,100).map((r,i)=><tr key={i} className="border-t border-gray-50 hover:bg-gray-50">
                     <td className="px-3 py-2 text-gray-700">{r.date}</td>
                     <td className="px-3 py-2 text-gray-500">{r.semaine}</td>
                     <td className="px-3 py-2 text-gray-700">{r.produit}</td>
@@ -4152,8 +4273,8 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           // v4.2.1 : message informatif, toujours auto-refermant — pas de file de reprise
           // automatique en arrière-plan (supprimée) : les données restent sûres en local,
           // et 🛟 Récupération d'urgence est le filet de sécurité manuel si besoin.
-          setSaveError("⚠️ Connexion au serveur impossible pour cette sauvegarde — vos données restent conservées sur cet appareil (🛟 Récupération d'urgence si besoin).");
-          setTimeout(()=>setSaveError(null), 8000);
+          setSaveError("⚠️ Enregistrement non confirmé par le serveur. Vos données sont conservées sur cet appareil.");
+          setTimeout(()=>setSaveError(null), 6000);
         };
         const onReadOnlyBlock = () => {
           setSaving(false);
