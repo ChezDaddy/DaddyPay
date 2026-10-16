@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.3.0 · Build du 14/10/2026 -->
+<!-- DaddyPay v4.3.1 · Build du 15/10/2026 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -630,6 +630,67 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       return out;
     };
 
+    // v4.3.1 : tri des devis, plus récent (date de saisie) en premier ; à égalité, id décroissant.
+    const sortDevisRecentFirst = (arr) => [...(arr||[])].sort((a,b)=>{
+      const k = (a.recorded_at||"").localeCompare(b.recorded_at||"");
+      return k !== 0 ? -k : ((b.id||0) - (a.id||0));
+    });
+
+    // v4.3.1 : génération d'un classeur Excel (.xlsx) SANS bibliothèque externe (fonctionne hors connexion).
+    // Un .xlsx est une archive ZIP de fichiers XML : on écrit ici une archive "stockée" (sans compression),
+    // avec cellules texte en ligne (inlineStr), une feuille par onglet, en-têtes en gras et figés, filtre auto.
+    const _crcTable = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+    const _crc32 = (b) => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = _crcTable[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+    const _zipStore = (files) => {
+      const enc = new TextEncoder();
+      const u16 = n => [n & 255, (n >> 8) & 255];
+      const u32 = n => [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >>> 24) & 255];
+      const parts = [], central = []; let offset = 0;
+      files.forEach(f => {
+        const name = enc.encode(f.name), data = f.data, crc = _crc32(data);
+        const local = new Uint8Array([0x50,0x4b,3,4, ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), ...u16(0)]);
+        parts.push(local, name, data);
+        central.push(new Uint8Array([0x50,0x4b,1,2, ...u16(20), ...u16(20), ...u16(0), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)]), name);
+        offset += local.length + name.length + data.length;
+      });
+      const cdSize = central.reduce((a, c) => a + c.length, 0);
+      const end = new Uint8Array([0x50,0x4b,5,6, ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(cdSize), ...u32(offset), ...u16(0)]);
+      const all = [...parts, ...central, end];
+      const out = new Uint8Array(all.reduce((a, c) => a + c.length, 0)); let o = 0;
+      all.forEach(c => { out.set(c, o); o += c.length; });
+      return out;
+    };
+    const _xlsxCol = (i) => { let s = "", n = i + 1; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
+    const _xlsxEsc = (v) => String(v).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    // sheets : [{ name, headers:[...], rows:[[...]], textCols:[indices forcés en texte] }]
+    const buildXlsx = (sheets) => {
+      const enc = new TextEncoder();
+      const NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"';
+      const sheetXml = (sh) => {
+        const widths = sh.headers.map((h, ci) => { let w = String(h).length + 2; sh.rows.forEach(r => { const l = r[ci] == null ? 0 : String(r[ci]).length; if (l + 2 > w) w = l + 2; }); return Math.min(45, Math.max(12, w)); });
+        const rowsXml = [sh.headers, ...sh.rows].map((row, ri) => {
+          const cells = row.map((v, ci) => {
+            if (v === null || v === undefined || v === "") return "";
+            const ref = _xlsxCol(ci) + (ri + 1), st = ri === 0 ? ' s="1"' : "";
+            if (ri > 0 && typeof v === "number" && isFinite(v) && !(sh.textCols || []).includes(ci)) return `<c r="${ref}"${st}><v>${v}</v></c>`;
+            return `<c r="${ref}" t="inlineStr"${st}><is><t xml:space="preserve">${_xlsxEsc(v)}</t></is></c>`;
+          }).join("");
+          return `<row r="${ri + 1}">${cells}</row>`;
+        }).join("");
+        const lastCol = _xlsxCol(Math.max(0, sh.headers.length - 1));
+        return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet ${NS}><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>${rowsXml}</sheetData><autoFilter ref="A1:${lastCol}${sh.rows.length + 1}"/></worksheet>`;
+      };
+      const files = [
+        { name: "[Content_Types].xml", xml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>` },
+        { name: "_rels/.rels", xml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>` },
+        { name: "xl/workbook.xml", xml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook ${NS} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>${sheets.map((sh, i) => `<sheet name="${_xlsxEsc(sh.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>` },
+        { name: "xl/_rels/workbook.xml.rels", xml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>` },
+        { name: "xl/styles.xml", xml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet ${NS}><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFD9E1F2"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>` },
+        ...sheets.map((sh, i) => ({ name: `xl/worksheets/sheet${i + 1}.xml`, xml: sheetXml(sh) })),
+      ].map(f => ({ name: f.name, data: enc.encode(f.xml) }));
+      return _zipStore(files);
+    };
+
     // Mutex par clé (cafe:section) — empêche les DELETE+INSERT entrelacés
     const _saveLocks  = new Map(); // clé → Promise en cours
     const _savePending = new Map(); // clé → dernière data en attente
@@ -1059,7 +1120,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.3.0 · Build du 14/10/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.3.1 · Build du 15/10/2026</p>
             </div>
           </div>
         </div>
@@ -1898,6 +1959,101 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       // Tarif Option 2 toujours dérivé de Option 1 + coût de l'extra — jamais une valeur stockée indépendante
       const servicesCalc = getServicesAvecCalcul(services, coutExtra);
 
+      // v4.3.1 : liste des devis dynamique. Toutes les 30 s et au retour sur l'onglet du navigateur, la liste est
+      // relue sur le serveur (lecture sans écrasement du local, cf. loadData) pour afficher les devis saisis
+      // depuis un autre poste. Pas de rafraîchissement tant qu'un formulaire, une décision, un paiement ou un
+      // document imprimable est ouvert, pour ne jamais perturber une saisie en cours.
+      useEffect(()=>{
+        let stop = false;
+        const busy = showForm || decisionId || paiementId || printDoc;
+        if (busy) return;
+        const refresh = async () => {
+          if (stop || document.hidden) return;
+          const fresh = await loadData(cafe, "privatisation", true);
+          if (stop || !Array.isArray(fresh)) return;
+          setRows(prev => JSON.stringify(prev) === JSON.stringify(fresh) ? prev : fresh);
+        };
+        const t = setInterval(refresh, 30000);
+        const onVis = () => { if (!document.hidden) refresh(); };
+        document.addEventListener("visibilitychange", onVis);
+        return ()=>{ stop = true; clearInterval(t); document.removeEventListener("visibilitychange", onVis); };
+      },[cafe, showForm, decisionId, paiementId, printDoc]);
+
+      // v4.3.1 : export Excel des devis, UN fichier à 2 onglets (tous les devis du café, toutes années), avec toutes les informations
+      // enregistrées tout au long du process : devis, décision, acompte, facturation finale et paiement du solde.
+      // Sans bibliothèque externe (fonctionne hors connexion). Onglets : "Devis" (une ligne par devis)
+      // et "Lignes" (une ligne par service et par étape), liés par le N° interne.
+      const buildDevisTables = () => {
+        const devis = sortDevisRecentFirst(rows.filter(r=>r.type_paiement!=="acompte"));
+        const COLS = [
+          ["id","N° interne"],["statut","Statut"],["cafe","Café"],["type_client","Type de client"],["date_devis","Date du devis"],
+          ["recorded_at","Saisi le"],["by","Dernier utilisateur"],["last_modified_at","Dernière modification"],
+          ["date_evenement","Date de l'événement"],["nb_convives","Nb de convives"],["option_choisie","Option choisie"],
+          ["structure","Structure"],["client","Client"],["prenom","Prénom"],["nom","Nom"],["nom_entreprise","Entreprise / association"],
+          ["siret_client","SIRET client"],["contact_nom","Contact"],["adresse","Adresse client"],["telephone","Téléphone"],["mail","Mail"],
+          ["contact_cafe","Contact café"],["adresse_cafe","Adresse café"],["surface_cafe","Surface café"],["siret_cafe","SIRET café"],["iban_cafe","IBAN café"],
+          ["montant_devis","Montant du devis (€)"],["date_decision","Date de décision"],
+          ["acompte_montant","Acompte (€)"],["acompte_mode","Mode de l'acompte"],["acompte_date_paiement","Date de paiement de l'acompte"],["acompte_row_id","N° ligne acompte"],
+          ["montant_ajuste_brut","Total final recalculé (€)"],["montant_facture_brut","Montant facture brut (€)"],["montant_facture","Solde facturé (€)"],
+          ["mode","Mode de règlement du solde"],["date_reglement","Date de règlement du solde"],["semaine","Semaine de comptabilisation"],["mois","Mois de comptabilisation"],
+        ];
+        const known = new Set(COLS.map(c=>c[0]));
+        // Autres champs enregistrés dans les devis (hors listes de lignes, exportées dans le fichier Lignes)
+        const extra = [];
+        devis.forEach(d => Object.keys(d).forEach(k => {
+          if (known.has(k) || k==="lignes" || k==="lignes_finales" || extra.includes(k)) return; // les listes de lignes sont dans le fichier Lignes
+          if (d[k] !== null && typeof d[k] === "object") return;
+          extra.push(k);
+        }));
+        const optLabel = v => v==="option1" ? "Option 1" : v==="option2" ? "Option 2" : (v||"");
+        const val = (d, k) => {
+          const v = d[k];
+          const aAcompte = (parseFloat(d.acompte_montant)||0) > 0;
+          // valeurs par défaut du formulaire : pas d'acompte => mode et date d'acompte sans objet
+          if ((k==="acompte_mode" || k==="acompte_date_paiement" || k==="acompte_row_id") && !aAcompte) return "";
+          if (k==="option_choisie") return optLabel(v);
+          if (typeof v === "boolean") return v ? "oui" : "non";
+          if (v === null || v === undefined) return "";
+          return v;
+        };
+        const headers = [...COLS.map(c=>c[1]), ...extra];
+        const devisRows = devis.map(d => { const o = {}; COLS.forEach(c=>{ o[c[1]] = val(d,c[0]); }); extra.forEach(k=>{ o[k] = val(d,k); }); return o; });
+
+        const headersL = ["N° interne","Client","Date de l'événement","Statut","Étape","Groupe","Service","Unité","Tarif unitaire, catalogue actuel (€)","Quantité","Montant de la ligne (€)"];
+        const lignesRows = [];
+        devis.forEach(d => {
+          const push = (arr, etape) => (arr||[]).filter(l=>(parseFloat(l.qte)||0)>0).forEach(l=>{
+            const sv = servicesCalc.find(x=>x.id===l.id);
+            const tarif = sv ? (parseFloat(sv.tarif)||0) : "";
+            const qte = parseFloat(l.qte)||0;
+            lignesRows.push({
+              "N° interne": d.id, "Client": d.client||"", "Date de l'événement": d.date_evenement||"", "Statut": d.statut||"", "Étape": etape,
+              "Groupe": sv ? sv.groupe : "", "Service": sv ? sv.label : `(service supprimé : ${l.id})`, "Unité": sv ? sv.unite : "",
+              "Tarif unitaire, catalogue actuel (€)": tarif, "Quantité": qte,
+              "Montant de la ligne (€)": tarif==="" ? "" : parseFloat((tarif*qte).toFixed(2)),
+            });
+          });
+          push(d.lignes, "Devis");
+          push(d.lignes_finales, "Facturation finale");
+        });
+        return { headers, devisRows, headersL, lignesRows };
+      };
+      const exportDevisExcel = () => {
+        const t = buildDevisTables();
+        if (t.devisRows.length === 0) { alert("Aucun devis à exporter."); return; }
+        const toRows = (objs, headers) => objs.map(o => headers.map(h => o[h]));
+        // Colonnes forcées en texte (identifiants longs, SIRET, téléphone, IBAN) : jamais affichées en notation scientifique
+        const TEXT = ["N° interne","N° ligne acompte","Téléphone","SIRET client","SIRET café","IBAN café"];
+        const sheets = [
+          { name: "Devis",  headers: t.headers,  rows: toRows(t.devisRows, t.headers),   textCols: t.headers.map((h,i)=>TEXT.includes(h)?i:-1).filter(i=>i>=0) },
+          { name: "Lignes", headers: t.headersL, rows: toRows(t.lignesRows, t.headersL), textCols: t.headersL.map((h,i)=>TEXT.includes(h)?i:-1).filter(i=>i>=0) },
+        ];
+        const blob = new Blob([buildXlsx(sheets)], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = `DaddyPay_Devis_${cafe}_${new Date().toISOString().slice(0,10)}.xlsx`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      };
+
       const newDevis = () => {
         const base = mkDevisForm(cafe);
         base.adresse_cafe = entete.adresse; base.surface_cafe = entete.surface; base.siret_cafe = entete.siret; base.iban_cafe = entete.iban;
@@ -2345,9 +2501,20 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       }
 
       // ── Liste des devis (vue par défaut) ──
-      const anneesDisponibles = [...new Set(rows.filter(r=>r.type_paiement!=="acompte").map(r=>r.date_evenement?.slice(0,4)).filter(Boolean))].sort((a,b)=>b-a);
-      if (!anneesDisponibles.includes(String(anneeListe))) anneesDisponibles.unshift(String(anneeListe));
-      const rowsAnnee = rows.filter(r=>r.type_paiement!=="acompte" && r.date_evenement?.slice(0,4)===String(anneeListe));
+      // Années proposées : celles des devis existants + l'année en cours + l'année suivante (on prépare
+      // des événements à venir : sans ça, impossible d'afficher 2027 tant qu'aucun devis 2027 n'existe),
+      // + le choix "Toutes" (v4.3.1).
+      const anneeCourante = new Date().getFullYear();
+      const anneesDisponibles = [...new Set([
+        ...rows.filter(r=>r.type_paiement!=="acompte").map(r=>r.date_evenement?.slice(0,4)).filter(Boolean),
+        String(anneeCourante), String(anneeCourante+1)
+      ])].sort((a,b)=>b-a);
+      if (anneeListe!=="all" && !anneesDisponibles.includes(String(anneeListe))) anneesDisponibles.unshift(String(anneeListe));
+      // Devis les plus récents (date de saisie) en haut, quel que soit l'ordre de stockage du tableau
+      const rowsAnnee = sortDevisRecentFirst(anneeListe==="all"
+        ? rows.filter(r=>r.type_paiement!=="acompte")
+        : rows.filter(r=>r.type_paiement!=="acompte" && r.date_evenement?.slice(0,4)===String(anneeListe)));
+      const libelleAnnee = anneeListe==="all" ? "toutes années" : String(anneeListe);
 
       return (
         <div className="space-y-6">
@@ -2355,11 +2522,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           {decisionModal}
           {paiementModal}
           <div className="flex justify-between items-center flex-wrap gap-2">
-            <h3 className="font-semibold text-gray-800">🎉 Privatisations — {rowsAnnee.length} devis ({anneeListe})</h3>
+            <h3 className="font-semibold text-gray-800">🎉 Privatisations — {rowsAnnee.length} devis ({libelleAnnee})</h3>
             <div className="flex gap-2 items-center">
-              <select value={anneeListe} onChange={e=>setAnneeListe(parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300">
+              <select value={anneeListe} onChange={e=>setAnneeListe(e.target.value==="all"?"all":parseInt(e.target.value))} className="border border-gray-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300">
+                <option value="all">Toutes</option>
                 {anneesDisponibles.map(a=><option key={a} value={a}>{a}</option>)}
               </select>
+              <button onClick={exportDevisExcel} className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2.5 rounded-xl text-sm font-semibold" title="Un fichier Excel à 2 onglets : Devis (un devis par ligne, toutes les informations du process) et Lignes (une ligne par service et par étape)">📥 Export Excel</button>
               <button onClick={newDevis} disabled={isReadOnly} className="bg-violet-600 hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed text-white px-5 py-2.5 rounded-xl text-sm font-semibold">+ Créer devis</button>
             </div>
           </div>
@@ -2388,7 +2557,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
                       </td>
                     </tr>
                   ))}
-                  {rowsAnnee.length===0 && <tr><td colSpan={9} className="text-center py-6 text-gray-400">Aucun devis pour {anneeListe}.</td></tr>}
+                  {rowsAnnee.length===0 && <tr><td colSpan={9} className="text-center py-6 text-gray-400">Aucun devis pour {libelleAnnee}.</td></tr>}
                 </tbody>
               </table>
             </div>
