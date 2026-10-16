@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- DaddyPay v4.3.1 · Build du 15/10/2026 -->
+<!-- DaddyPay v4.3.2 · Build du 16/10/2026 -->
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
@@ -333,7 +333,7 @@
       const rows = [];
       await Promise.all(cafes.map(async cafe => {
         const [ct,tc,dn,ac,pv,rc,adherents] = await Promise.all(["caisseta","tcam","dons","achats","privatisation","restocollective","adherents"].map(s=>loadData(cafe,s)));
-        const all = [{s:"caisseta",d:ct},{s:"tcam",d:tc},{s:"dons",d:dn},{s:"achats",d:ac},{s:"privatisation",d:pv}];
+        const all = [{s:"caisseta",d:fillEventPerDate(ct)},{s:"tcam",d:tc},{s:"dons",d:dn},{s:"achats",d:ac},{s:"privatisation",d:pv}];
         all.forEach(({s,d})=>d.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:s.toUpperCase(),...normalizeRow(r,s)})));
         rc.filter(filterFn).forEach(r=>rows.push({Café:cafe,Section:"RESTOCOLLECTIVE",...normalizeRow(r,"restocollective")}));
         explodeAdhesionRows(adherents).filter(filterFn).forEach(r=>rows.push({Café:cafe,...r}));
@@ -629,6 +629,31 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
       }
       return out;
     };
+
+    // v4.3.2 : année affichée par défaut dans les Dashboards = l'année courante si elle existe dans les données,
+    // sinon la plus récente année qui ne dépasse pas l'année courante. Avant, c'était la plus grande année présente :
+    // un devis de privatisation pour un événement de 2027 (ou une adhésion 2027) faisait ouvrir le Dashboard sur 2027.
+    const defaultAnneeDash = (annees) => {
+      const list = (annees||[]).map(String);
+      const cur = String(new Date().getFullYear());
+      if (list.includes(cur)) return cur;
+      const passees = list.filter(a => a <= cur).sort((a,b)=>b-a);
+      return passees.length ? passees[0] : list[0];
+    };
+
+    // v4.3.2 : un événement TA est déclaré pour une DATE : toutes les lignes de Caisse TA de cette date doivent le porter.
+    // Cette fonction complète à la lecture (exports, Dashboards) les lignes d'une date dont l'événement manque, avec
+    // l'événement le plus anciennement saisi pour cette date. Elle ne modifie pas le tableau d'origine.
+    const fillEventPerDate = (rows) => {
+      const evtByDate = {};
+      [...(rows||[])].filter(r => r && r.evenement_ta)
+        .sort((a,b) => (a.recorded_at||"").localeCompare(b.recorded_at||""))
+        .forEach(r => { if (!evtByDate[r.date]) evtByDate[r.date] = r.evenement_ta; });
+      return (rows||[]).map(r => (r && !r.evenement_ta && evtByDate[r.date]) ? { ...r, evenement_ta: evtByDate[r.date] } : r);
+    };
+
+    // v4.3.2 : "1 ligne" / "N lignes" (le 0 reste au pluriel, comme dans les cartes existantes)
+    const plurN = (n, sing, plur) => `${n} ${n===1 ? sing : plur}`;
 
     // v4.3.1 : tri des devis, plus récent (date de saisie) en premier ; à égalité, id décroissant.
     const sortDevisRecentFirst = (arr) => [...(arr||[])].sort((a,b)=>{
@@ -1068,7 +1093,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
     const exportToXLSX = (cafe, period, periodType, allData) => {
       const fn = (row) => { const d = row.date || row.date_evenement; if (!d) return false; if (periodType==="week") return row.semaine===period; if (periodType==="month") return row.mois===parseInt(period.replace("M","")); return true; };
       const rows = [];
-      ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (allData[s]||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(), ...normalizeRow(r,s)})));
+      ["caisseta","tcam","dons","achats","privatisation"].forEach(s => (s==="caisseta" ? fillEventPerDate(allData[s]||[]) : (allData[s]||[])).filter(fn).forEach(r => rows.push({Café:cafe, Section:s.toUpperCase(), ...normalizeRow(r,s)})));
       (allData.restocollective||[]).filter(fn).forEach(r => rows.push({Café:cafe, Section:"RESTOCOLLECTIVE", ...normalizeRow(r,"restocollective")}));
       explodeAdhesionRows(allData.adherents).filter(fn).forEach(r => rows.push({Café:cafe, ...r}));
       buildAndDownloadCSV(rows, `DaddyCafe_${cafe}_${period}_${new Date().toISOString().slice(0,10)}.csv`);
@@ -1120,7 +1145,7 @@ ${csv.slice(0,8000)}${csv.length>8000?"…(tronqué)":""}`
                   <button onClick={()=>setShow(v=>!v)} className="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600 text-xs">{show?"🙈":"👁️"}</button></div></div>
               {err&&<p className="text-xs text-rose-600 bg-rose-50 px-3 py-2 rounded-lg">{err}</p>}
               <button onClick={submit} disabled={checking} style={{backgroundColor:ADMIN_COLOR}} className="w-full hover:opacity-90 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-opacity shadow-sm">{checking?"Connexion…":"Se connecter"}</button>
-              <p className="text-center text-xs text-gray-400 mt-3">v4.3.1 · Build du 15/10/2026</p>
+              <p className="text-center text-xs text-gray-400 mt-3">v4.3.2 · Build du 16/10/2026</p>
             </div>
           </div>
         </div>
@@ -1736,12 +1761,19 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
       const [montantDonne,setMontantDonne]=useState("");
       const [evenementActif,setEvenementActif]=useState(false);
       const [evenementTexte,setEvenementTexte]=useState("");
+      const [evtEdit,setEvtEdit]=useState(false); // v4.3.2 : modification du libellé d'un événement déjà déclaré pour la date
       useEffect(()=>{loadData(cafe,"caisseta").then(d=>{setRows(d);setLoading(false);});},[cafe,refreshTick]);
       const total = panier.reduce((s,l)=>s+l.prix_unitaire*l.qte,0);
       const add = (label) => { if(!label)return; const item=carte.find(c=>c.label===label); if(!item)return; setPanier(p=>{const ei=p.findIndex(l=>l.produit===label); if(ei>=0){const c=[...p];c[ei]={...c[ei],qte:c[ei].qte+1};return c;} return [...p,{produit:label,prix_unitaire:item.prix,qte:1,typo:item.type,tva_taux:item.tva_taux||"0",prix_ht:item.prix_ht||calcHT(item.prix,item.tva_taux||"0")}];}); setSelProd(""); };
       const upd = (i,d)=>setPanier(p=>{const c=[...p];c[i]={...c[i],qte:Math.max(1,c[i].qte+d)};return c;});
       const rem = (i)=>setPanier(p=>p.filter((_,j)=>j!==i));
-      const valider = async()=>{ if(isReadOnly||!panier.length||!date)return; const now=Date.now(); const recAt=localDateTime(); const evt=(evenementActif&&evenementTexte.trim())?evenementTexte.trim().slice(0,20):null; const nr=panier.map((l,i)=>({id:now+i,date,semaine:getWeekForDate(date),mois:getMonthForDate(date),produit:l.produit,qte:l.qte,prix_unitaire:l.prix_unitaire,prix_total:parseFloat((l.prix_unitaire*l.qte).toFixed(2)),mode,typo:l.typo,...(l.tva_taux&&l.tva_taux!=="0"?{tva_taux:l.tva_taux,prix_ht:l.prix_ht}:{}),...(evt?{evenement_ta:evt}:{}),recorded_at:recAt,by})); const upd=[...nr,...rows]; setRows(upd); setPanier([]); setMontantDonne(""); await saveData(cafe,"caisseta",upd); };
+      // v4.3.2 : événement du jour = celui déjà déclaré sur une ligne de cette date (il s'applique à toutes les lignes du jour)
+      const evtJour = (rows.find(r=>r.date===date && r.evenement_ta)||{}).evenement_ta || "";
+      const valider = async()=>{ if(isReadOnly||!panier.length||!date)return; const now=Date.now(); const recAt=localDateTime(); const evt=evtJour || ((evenementActif&&evenementTexte.trim())?evenementTexte.trim().slice(0,20):null); const nr=panier.map((l,i)=>({id:now+i,date,semaine:getWeekForDate(date),mois:getMonthForDate(date),produit:l.produit,qte:l.qte,prix_unitaire:l.prix_unitaire,prix_total:parseFloat((l.prix_unitaire*l.qte).toFixed(2)),mode,typo:l.typo,...(l.tva_taux&&l.tva_taux!=="0"?{tva_taux:l.tva_taux,prix_ht:l.prix_ht}:{}),...(evt?{evenement_ta:evt}:{}),recorded_at:recAt,by})); // l'événement est reporté sur toutes les lignes DÉJÀ saisies pour cette date (v4.3.2)
+        const base = evt ? rows.map(r=>(r.date===date && !r.evenement_ta) ? {...r,evenement_ta:evt} : r) : rows;
+        const upd=[...nr,...base]; setRows(upd); setPanier([]); setMontantDonne(""); await saveData(cafe,"caisseta",upd); };
+      const appliquerEvt = async (label) => { if(isReadOnly) return; const lab=(label||"").trim().slice(0,20); if(!lab||!date) return; const upd=rows.map(r=>r.date===date?{...r,evenement_ta:lab}:r); setRows(upd); setEvtEdit(false); setEvenementActif(false); setEvenementTexte(""); await saveData(cafe,"caisseta",upd); };
+      const retirerEvt = async () => { if(isReadOnly) return; if(!window.confirm(`Retirer l'événement "${evtJour}" de toutes les lignes du ${date} ?`)) return; const upd=rows.map(r=>(r.date===date && r.evenement_ta) ? (({evenement_ta,...rest})=>rest)(r) : r); setRows(upd); setEvtEdit(false); setEvenementActif(false); setEvenementTexte(""); await saveData(cafe,"caisseta",upd); };
       const del = async(id)=>{ setConfirmId(null); const u=rows.filter(r=>r.id!==id); setRows(u); await saveData(cafe,"caisseta",u); };
       if(loading)return<div className="p-8 text-center text-gray-400">Chargement...</div>;
       const softs=carte.filter(c=>c.type==="Soft"), alcools=carte.filter(c=>c.type==="Alcool"), nourr=carte.filter(c=>c.type==="Snacking");
@@ -1751,12 +1783,24 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
           <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-5">
             <h3 className="font-semibold text-gray-800 mb-4">🍸 Nouvelle commande TA</h3>
             <div className="mb-4 flex flex-wrap items-end gap-4">
-              <div><label className="text-xs text-gray-500 block mb-1">Date</label><input type="date" value={date} onChange={e=>{setDate(e.target.value);setEvenementActif(false);setEvenementTexte("");}} className="w-48 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300"/></div>
-              <div className="flex items-center gap-2 pb-2">
-                <input type="checkbox" id="evtCheck" checked={evenementActif} onChange={e=>{setEvenementActif(e.target.checked); if(!e.target.checked) setEvenementTexte("");}} className="w-4 h-4 accent-emerald-500"/>
-                <label htmlFor="evtCheck" className="text-sm text-gray-600 cursor-pointer">📌 Déclarer un événement pour cette date</label>
-              </div>
-              {evenementActif&&<div><input type="text" maxLength={20} value={evenementTexte} onChange={e=>setEvenementTexte(e.target.value)} placeholder="Ex: Brocante" className="w-48 border-2 border-emerald-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300 bg-emerald-50"/><p className="text-xs text-gray-400 mt-0.5">{evenementTexte.length}/20</p></div>}
+              <div><label className="text-xs text-gray-500 block mb-1">Date</label><input type="date" value={date} onChange={e=>{setDate(e.target.value);setEvenementActif(false);setEvenementTexte("");setEvtEdit(false);}} className="w-48 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300"/></div>
+              {evtJour && !evtEdit ? (
+                <div className="flex flex-wrap items-center gap-2 pb-1">
+                  <span className="text-sm font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-1.5">📌 Événement du jour : {evtJour}</span>
+                  <span className="text-xs text-gray-400">appliqué à toutes les lignes du {date}</span>
+                  {!isReadOnly && <button type="button" onClick={()=>{setEvtEdit(true);setEvenementTexte(evtJour);}} className="text-xs text-gray-500 hover:text-emerald-700 underline">Modifier</button>}
+                  {!isReadOnly && <button type="button" onClick={retirerEvt} className="text-xs text-rose-500 hover:text-rose-700 underline">Retirer</button>}
+                </div>
+              ) : (<>
+                {!evtEdit && <div className="flex items-center gap-2 pb-2">
+                  <input type="checkbox" id="evtCheck" checked={evenementActif} onChange={e=>{setEvenementActif(e.target.checked); if(!e.target.checked) setEvenementTexte("");}} className="w-4 h-4 accent-emerald-500"/>
+                  <label htmlFor="evtCheck" className="text-sm text-gray-600 cursor-pointer">📌 Déclarer un événement pour cette date</label>
+                </div>}
+                {(evenementActif||evtEdit)&&<div className="flex flex-wrap items-start gap-2"><div><input type="text" maxLength={20} value={evenementTexte} onChange={e=>setEvenementTexte(e.target.value)} placeholder="Ex: Brocante" className="w-48 border-2 border-emerald-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300 bg-emerald-50"/><p className="text-xs text-gray-400 mt-0.5">{evenementTexte.length}/20</p></div>
+                  <button type="button" disabled={!evenementTexte.trim()} onClick={()=>appliquerEvt(evenementTexte)} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white px-3 py-2 rounded-lg text-xs font-semibold">✔ Appliquer à toutes les lignes du {date}</button>
+                  {evtEdit && <button type="button" onClick={()=>{setEvtEdit(false);setEvenementTexte("");}} className="text-xs text-gray-500 underline py-2">Annuler</button>}
+                </div>}
+              </>)}
             </div>
             <div className="mb-4 space-y-2">
               {[["Softs","teal",softs],["Alcools","amber",alcools],["Snacking","rose",nourr]].map(([lbl,col,items])=>(
@@ -2613,7 +2657,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         ...allData.adhesion.map(r=>r.annee?String(r.annee):null),
       ].filter(Boolean))].sort((a,b)=>b-a);
       const [anneeDash,setAnneeDash]=useState("");
-      useEffect(()=>{ if(!anneeDash && anneesDisponiblesDash.length) setAnneeDash(String(anneesDisponiblesDash[0])); },[anneesDisponiblesDash.join(",")]);
+      useEffect(()=>{ if(!anneeDash && anneesDisponiblesDash.length) setAnneeDash(defaultAnneeDash(anneesDisponiblesDash)); },[anneesDisponiblesDash.join(",")]);
       useEffect(()=>{ (async()=>{ setLoading(true); const [caisseta,tcam,dons,achats,privatisation,adherents,restocollective]=await Promise.all([loadData(cafe,"caisseta"),loadData(cafe,"tcam"),loadData(cafe,"dons"),loadData(cafe,"achats"),loadData(cafe,"privatisation"),loadData(cafe,"adherents"),loadData(cafe,"restocollective")]); const adhesion=deriveAdhesionAgg(adherents||[]); setAllData({caisseta,tcam,dons,achats,privatisation,adhesion,adherents,restocollective}); setLoading(false); })(); },[cafe, refreshTick]);
       const fil=useCallback((arr)=>{
         const parAnnee = anneeDash ? arr.filter(r=>{ const d = r.annee ? String(r.annee) : (r.date||r.date_evenement)?.slice(0,4); return d===anneeDash; }) : arr;
@@ -2659,13 +2703,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             </div>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-            <StatCard label="Total TA" value={`${tTA.toFixed(2)} €`} sub={`${fTA.length} lignes`} color="emerald"/>
-            <StatCard label="Total TCAM" value={`${tTCAM.toFixed(2)} €`} sub={`${fTCAM.length} lignes`} color="amber"/>
-            <StatCard label="Total Dons" value={`${tD.toFixed(2)} €`} sub={`${fD.length} dons`} color="rose"/>
-            <StatCard label="Total Achats" value={`${tA.toFixed(2)} €`} sub={`${fA.length} achats`} color="sky"/>
-            <StatCard label="Privatisations" value={`${tP.toFixed(2)} €`} sub={`${fP.filter(r=>r.type_paiement!=="acompte").length} événements`} color="violet"/>
-            <StatCard label="Adhésions" value={`${tADH.toFixed(2)} €`} sub={`${nbAdhIndiv+nbAdhStruc} saisies (${nbAdhIndiv} indiv. + ${nbAdhStruc} struct.)`} color="violet"/>
-            {(rcOn||tRC>0)&&<StatCard label="Resto Collective" value={`${tRC.toFixed(2)} €`} sub={`${fRC.length} lignes (TTC)`} color="amber"/>}
+            <StatCard label="Total TA" value={`${tTA.toFixed(2)} €`} sub={plurN(fTA.length,"ligne","lignes")} color="emerald"/>
+            <StatCard label="Total TCAM" value={`${tTCAM.toFixed(2)} €`} sub={plurN(fTCAM.length,"ligne","lignes")} color="amber"/>
+            <StatCard label="Total Dons" value={`${tD.toFixed(2)} €`} sub={plurN(fD.length,"don","dons")} color="rose"/>
+            <StatCard label="Total Achats" value={`${tA.toFixed(2)} €`} sub={plurN(fA.length,"achat","achats")} color="sky"/>
+            <StatCard label="Privatisations" value={`${tP.toFixed(2)} €`} sub={plurN(fP.filter(r=>r.type_paiement!=="acompte").length,"événement","événements")} color="violet"/>
+            <StatCard label="Adhésions" value={`${tADH.toFixed(2)} €`} sub={`${plurN(nbAdhIndiv+nbAdhStruc,"saisie","saisies")} (${nbAdhIndiv} indiv. + ${nbAdhStruc} struct.)`} color="violet"/>
+            {(rcOn||tRC>0)&&<StatCard label="Resto Collective" value={`${tRC.toFixed(2)} €`} sub={`${plurN(fRC.length,"ligne","lignes")} (TTC)`} color="amber"/>}
             <StatCard label="Total encaissé" value={`${(tTA+tTCAM+tD+tP+tADH+tRC).toFixed(2)} €`} sub="TA + TCAM + Dons + Privat. + Adh. + RC" color="emerald"/>
             {(()=>{
               const todayMD = new Date().toISOString().slice(5,10); // "MM-DD"
@@ -2727,7 +2771,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
               rowsToShow.forEach(({w,wTA,wTC,wD,wA,wADH,wRC})=>{
                 out.push(<tr key={w.label} className="border-t border-gray-50 hover:bg-gray-50"><td className="px-3 py-2 font-medium text-gray-700">{w.label}</td><td className="px-3 py-2 text-emerald-600">{wTA.toFixed(2)}€</td><td className="px-3 py-2 text-amber-600">{wTC.toFixed(2)}€</td><td className="px-3 py-2 text-rose-600">{wD.toFixed(2)}€</td><td className="px-3 py-2 text-indigo-600">{wADH.toFixed(2)}€</td><td className="px-3 py-2 text-orange-600">{wRC.toFixed(2)}€</td><td className="px-3 py-2 text-sky-600">-{wA.toFixed(2)}€</td><td className="px-3 py-2 font-bold text-gray-800">{(wTA+wTC+wD+wADH+wRC).toFixed(2)}€</td><td className="px-3 py-2"></td></tr>);
                 // 2ème ligne par événement TA distinct sur cette semaine
-                const evtRows = allData.caisseta.filter(r=>r.semaine===w.label && r.evenement_ta);
+                const evtRows = fillEventPerDate(allData.caisseta).filter(r=>r.semaine===w.label && r.evenement_ta);
                 const evtLabels = [...new Set(evtRows.map(r=>r.evenement_ta))];
                 evtLabels.forEach(evtLabel=>{
                   const evtTA = sum(evtRows.filter(r=>r.evenement_ta===evtLabel));
@@ -3013,7 +3057,7 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         ];
       }).filter(Boolean))].sort((a,b)=>b-a);
       const [anneeDash,setAnneeDash]=useState("");
-      useEffect(()=>{ if(!anneeDash && anneesDisponiblesDash.length) setAnneeDash(String(anneesDisponiblesDash[0])); },[anneesDisponiblesDash.join(",")]);
+      useEffect(()=>{ if(!anneeDash && anneesDisponiblesDash.length) setAnneeDash(defaultAnneeDash(anneesDisponiblesDash)); },[anneesDisponiblesDash.join(",")]);
       const fil=useCallback((arr)=>{
         const parAnnee = anneeDash ? safeArr(arr).filter(r=>{ const d = r.annee ? String(r.annee) : (r.date||r.date_evenement)?.slice(0,4); return d===anneeDash; }) : safeArr(arr);
         if(ft==="week")return parAnnee.filter(r=>r.semaine===sw); if(ft==="month")return parAnnee.filter(r=>r.mois===sm); return parAnnee;
@@ -3041,15 +3085,15 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         </div>;
       }
 
-      let stats = [], GT = {ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0};
+      let stats = [], GT = {ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0,nTA:0,nTC:0,nDn:0,nAc:0,nPv:0,nRc:0,nAdhI:0,nAdhS:0};
       try {
-        stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=filAdh(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=n(sum(fTA)),tc=n(sum(fTC,"montant")),dn=n(sum(fD,"montant")),ac=n(sum(fA,"montant")),pv=n(sum(fP,"montant_facture")),adh=n(sum(fADH,"total")),rc=n(sum(fRC,"prix_total")); return{cafe,ta,tc,dn,ac,pv,adh,rc,total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH}; });
-        GT=stats.reduce((s,c)=>({ta:s.ta+n(c.ta),tc:s.tc+n(c.tc),dn:s.dn+n(c.dn),ac:s.ac+n(c.ac),pv:s.pv+n(c.pv),adh:s.adh+n(c.adh),rc:s.rc+n(c.rc),total:s.total+n(c.total)}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0});
+        stats=cafes.map(cafe=>{ const d=allCafesData[cafe]||{}; const fTA=fil(safeArr(d.caisseta)),fTC=fil(safeArr(d.tcam)),fD=fil(safeArr(d.dons)),fA=fil(safeArr(d.achats)),fP=fil(safeArr(d.privatisation)),fADH=filAdh(safeArr(d.adhesion)),fRC=fil(safeArr(d.restocollective)); const ta=n(sum(fTA)),tc=n(sum(fTC,"montant")),dn=n(sum(fD,"montant")),ac=n(sum(fA,"montant")),pv=n(sum(fP,"montant_facture")),adh=n(sum(fADH,"total")),rc=n(sum(fRC,"prix_total")); return{cafe,ta,tc,dn,ac,pv,adh,rc,total:n(ta+tc+dn+pv+adh+rc),fTA,fTC,fD,fADH, nTA:fTA.length,nTC:fTC.length,nDn:fD.length,nAc:fA.length,nPv:fP.filter(r=>r.type_paiement!=="acompte").length,nRc:fRC.length,nAdhI:sum(fADH,"nb_indiv"),nAdhS:sum(fADH,"nb_struc")}; });
+        GT=stats.reduce((s,c)=>({ta:s.ta+n(c.ta),tc:s.tc+n(c.tc),dn:s.dn+n(c.dn),ac:s.ac+n(c.ac),pv:s.pv+n(c.pv),adh:s.adh+n(c.adh),rc:s.rc+n(c.rc),total:s.total+n(c.total),nTA:s.nTA+n(c.nTA),nTC:s.nTC+n(c.nTC),nDn:s.nDn+n(c.nDn),nAc:s.nAc+n(c.nAc),nPv:s.nPv+n(c.nPv),nRc:s.nRc+n(c.nRc),nAdhI:s.nAdhI+n(c.nAdhI),nAdhS:s.nAdhS+n(c.nAdhS)}),{ta:0,tc:0,dn:0,ac:0,pv:0,adh:0,rc:0,total:0,nTA:0,nTC:0,nDn:0,nAc:0,nPv:0,nRc:0,nAdhI:0,nAdhS:0});
       } catch(statsErr) { console.error("STATS CRASH:", statsErr.message, statsErr.stack); }
 
       let weekly = [];
       try {
-        { const curIdx=WEEKS_2026.findIndex(w=>w.label===getCurrentWeekLabel()); const start=curIdx>=0?curIdx:0; const weeksDesc=WEEKS_2026.slice(Math.max(0,start-9),start+1).slice().reverse(); const _curLabel=getCurrentWeekLabel(); weekly=weeksDesc.map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; const evtMap={}; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); (d.caisseta||[]).filter(r=>r.semaine===w.label&&r.evenement_ta).forEach(r=>{ evtMap[r.evenement_ta]=(evtMap[r.evenement_ta]||0)+(parseFloat(r.prix_total)||0); }); }); const evenements=Object.entries(evtMap).map(([label,montant])=>({label,montant})); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh,evenements}; }).filter(r=>r.week===_curLabel||r.ta+r.tc+r.dn+r.ac+r.adh>0); }
+        { const curIdx=WEEKS_2026.findIndex(w=>w.label===getCurrentWeekLabel()); const start=curIdx>=0?curIdx:0; const weeksDesc=WEEKS_2026.slice(Math.max(0,start-9),start+1).slice().reverse(); const _curLabel=getCurrentWeekLabel(); weekly=weeksDesc.map(w=>{ let ta=0,tc=0,dn=0,ac=0,adh=0; const evtMap={}; cafes.forEach(c=>{ const d=allCafesData[c]||{}; ta+=sum((d.caisseta||[]).filter(r=>r.semaine===w.label)); tc+=sum((d.tcam||[]).filter(r=>r.semaine===w.label),"montant"); dn+=sum((d.dons||[]).filter(r=>r.semaine===w.label),"montant"); ac+=sum((d.achats||[]).filter(r=>r.semaine===w.label),"montant"); adh+=sum((d.adhesion||[]).filter(r=>r.semaine===w.label),"total"); fillEventPerDate(d.caisseta||[]).filter(r=>r.semaine===w.label&&r.evenement_ta).forEach(r=>{ evtMap[r.evenement_ta]=(evtMap[r.evenement_ta]||0)+(parseFloat(r.prix_total)||0); }); }); const evenements=Object.entries(evtMap).map(([label,montant])=>({label,montant})); return{week:w.label,ta,tc,dn,ac,adh,total:ta+tc+dn+adh,evenements}; }).filter(r=>r.week===_curLabel||r.ta+r.tc+r.dn+r.ac+r.adh>0); }
       } catch(wErr) { console.error("WEEKLY CRASH:", wErr.message); }
 
       const handleExport=async()=>{
@@ -3090,13 +3134,13 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
             </div>
             {/* KPIs */}
             <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-              <StatCard label="Total TA — tous cafés" value={`${(GT.ta||0).toFixed(2)} €`} color="emerald"/>
-              <StatCard label="Total TCAM — tous cafés" value={`${(GT.tc||0).toFixed(2)} €`} color="amber"/>
-              <StatCard label="Total Dons — tous cafés" value={`${(GT.dn||0).toFixed(2)} €`} color="rose"/>
-              <StatCard label="Total Achats — tous cafés" value={`${(GT.ac||0).toFixed(2)} €`} color="sky"/>
-              <StatCard label="Privatisations" value={`${(GT.pv||0).toFixed(2)} €`} color="violet"/>
-              <StatCard label="Adhésions — tous cafés" value={`${(GT.adh||0).toFixed(2)} €`} color="violet"/>
-              {GT.rc>0&&<StatCard label="Resto Collective — tous cafés" value={`${(GT.rc||0).toFixed(2)} €`} color="amber" sub="TTC (tous cafés RC)"/>}
+              <StatCard label="Total TA — tous cafés" value={`${(GT.ta||0).toFixed(2)} €`} sub={plurN(GT.nTA||0,"ligne","lignes")} color="emerald"/>
+              <StatCard label="Total TCAM — tous cafés" value={`${(GT.tc||0).toFixed(2)} €`} sub={plurN(GT.nTC||0,"ligne","lignes")} color="amber"/>
+              <StatCard label="Total Dons — tous cafés" value={`${(GT.dn||0).toFixed(2)} €`} sub={plurN(GT.nDn||0,"don","dons")} color="rose"/>
+              <StatCard label="Total Achats — tous cafés" value={`${(GT.ac||0).toFixed(2)} €`} sub={plurN(GT.nAc||0,"achat","achats")} color="sky"/>
+              <StatCard label="Privatisations" value={`${(GT.pv||0).toFixed(2)} €`} sub={plurN(GT.nPv||0,"événement","événements")} color="violet"/>
+              <StatCard label="Adhésions — tous cafés" value={`${(GT.adh||0).toFixed(2)} €`} sub={`${plurN((GT.nAdhI||0)+(GT.nAdhS||0),"saisie","saisies")} (${GT.nAdhI||0} indiv. + ${GT.nAdhS||0} struct.)`} color="violet"/>
+              {GT.rc>0&&<StatCard label="Resto Collective — tous cafés" value={`${(GT.rc||0).toFixed(2)} €`} color="amber" sub={`${plurN(GT.nRc||0,"ligne","lignes")} (TTC, tous cafés RC)`}/>}
               <StatCard label="GRAND TOTAL encaissé" value={`${(GT.total||0).toFixed(2)} €`} color="emerald" sub="TA + TCAM + Dons + Privat. + Adh. + RC"/>
             </div>
             {/* Tableau par café */}
@@ -3545,11 +3589,23 @@ GRANT ALL ON daddy_data TO anon;`}</pre>
         const section = a.structure ? "ADH.STRUCTURE" : "ADH.INDIV.";
         const key = `${date}_${section}_${mode}`;
         if (!byKey[key]) {
-          byKey[key] = { Section: section, date, semaine: getWeekForDate(date), mois: getMonthForDate(date), mode, "montant TTC payé": 0 };
+          byKey[key] = { Section: section, date, semaine: getWeekForDate(date), mois: getMonthForDate(date), mode, "montant TTC payé": 0, _ids: [], _rec: "", _by: new Set() };
         }
         byKey[key]["montant TTC payé"] += parseFloat(a.montant) || 0;
+        // v4.3.2 : traçabilité des lignes agrégées. Une ligne ADH. regroupe plusieurs fiches (jour x mode) :
+        // id = identifiants des fiches regroupées (rapprochables de l'export Adhérents), recorded_at = date et heure
+        // d'enregistrement la plus récente parmi elles, by = utilisateur(s) ayant saisi ces fiches.
+        if (a.id !== undefined && a.id !== null && a.id !== "") byKey[key]._ids.push(a.id);
+        if (a.created_at && a.created_at > byKey[key]._rec) byKey[key]._rec = a.created_at;
+        if (a.by) byKey[key]._by.add(a.by);
       });
-      return Object.values(byKey).map(r => ({ ...r, "montant TTC payé": Math.round(r["montant TTC payé"]*100)/100 }));
+      return Object.values(byKey).map(({ _ids, _rec, _by, ...r }) => ({
+        ...r,
+        "montant TTC payé": Math.round(r["montant TTC payé"]*100)/100,
+        id: _ids.slice().sort((x,y)=>(parseFloat(x)-parseFloat(y)) || String(x).localeCompare(String(y))).join("+"),
+        recorded_at: _rec,
+        by: [..._by].sort().join("+"),
+      }));
     };
     const mkAdhForm = () => ({
       semaine: getCurrentWeekLabel(),
